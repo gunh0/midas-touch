@@ -5,11 +5,15 @@ import (
 	"os"
 	"strconv"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/gunh0/midas-touch/internal/advisor"
 	"github.com/gunh0/midas-touch/internal/marketdata"
 	"github.com/gunh0/midas-touch/internal/telegram"
 )
+
+// scheduledHoursKST defines the hours (Asia/Seoul) at which the advisor fires.
+var scheduledHoursKST = []int{0, 4, 8, 12, 16, 20}
 
 func main() {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -18,7 +22,6 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables are required")
 	}
 
-	interval := parseInterval(os.Getenv("ADVISOR_INTERVAL"))
 	runOnce := parseBool(os.Getenv("ADVISOR_RUN_ONCE"))
 
 	tgClient := telegram.NewClient(token, chatID)
@@ -55,7 +58,7 @@ func main() {
 			return
 		}
 
-		log.Printf("hourly recommendation sent: action=%s buy=%.0f sell=%.0f hold=%.0f", reco.Action, reco.BuyPercent, reco.SellPercent, reco.HoldPercent)
+		log.Printf("recommendation sent: action=%s buy=%.0f sell=%.0f hold=%.0f", reco.Action, reco.BuyPercent, reco.SellPercent, reco.HoldPercent)
 	}
 
 	send()
@@ -63,28 +66,38 @@ func main() {
 		return
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	for {
+		next := nextScheduledTime(time.Now(), scheduledHoursKST)
+		waitDur := time.Until(next)
+		log.Printf("next run at %s KST (in %s)",
+			next.In(mustLoadKST()).Format("2006-01-02 15:04:05"),
+			waitDur.Round(time.Second),
+		)
+		time.Sleep(waitDur)
 		send()
 	}
 }
 
-func parseInterval(value string) time.Duration {
-	if value == "" {
-		return time.Hour
+func nextScheduledTime(now time.Time, hours []int) time.Time {
+	loc := mustLoadKST()
+	nowKST := now.In(loc)
+	for _, h := range hours {
+		candidate := time.Date(nowKST.Year(), nowKST.Month(), nowKST.Day(), h, 0, 0, 0, loc)
+		if candidate.After(nowKST) {
+			return candidate
+		}
 	}
-	d, err := time.ParseDuration(value)
+	tomorrow := nowKST.AddDate(0, 0, 1)
+	return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), hours[0], 0, 0, 0, loc)
+}
+
+func mustLoadKST() *time.Location {
+	loc, err := time.LoadLocation("Asia/Seoul")
 	if err != nil {
-		log.Printf("invalid ADVISOR_INTERVAL %q, fallback to 1h", value)
-		return time.Hour
+		log.Printf("Asia/Seoul timezone unavailable, using UTC+9 fixed offset: %v", err)
+		return time.FixedZone("KST", 9*60*60)
 	}
-	if d < time.Minute {
-		log.Printf("ADVISOR_INTERVAL too small (%s), fallback to 1h", d)
-		return time.Hour
-	}
-	return d
+	return loc
 }
 
 func parseBool(value string) bool {
