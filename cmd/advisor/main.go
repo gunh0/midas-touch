@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -16,6 +17,9 @@ import (
 var scheduledHoursKST = []int{0, 4, 8, 12, 16, 20}
 
 func main() {
+	cleanupLogger := setupLogger()
+	defer cleanupLogger()
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
 	if token == "" || chatID == "" {
@@ -75,6 +79,30 @@ func main() {
 		)
 		time.Sleep(waitDur)
 		send()
+	}
+}
+
+func setupLogger() func() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	logPath := os.Getenv("ADVISOR_LOG_FILE")
+	if logPath == "" {
+		logPath = "advisor.log"
+	}
+
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Printf("failed to open log file (%s): %v", logPath, err)
+		return func() {}
+	}
+
+	log.SetOutput(io.MultiWriter(os.Stdout, file))
+	log.Printf("logging to stdout and file: %s", logPath)
+
+	return func() {
+		if err := file.Close(); err != nil {
+			log.Printf("failed to close log file (%s): %v", logPath, err)
+		}
 	}
 }
 

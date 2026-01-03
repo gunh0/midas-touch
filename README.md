@@ -22,23 +22,38 @@ FINNHUB_API_KEY=your_finnhub_api_key
 
 ```bash
 # Telegram send test
-make test
+make local-notify-test
 
 # Trading advisor: one-time forced send (test)
-make advisor-test
+make local-advisor-test
 
-# Trading advisor: run every hour
-make advisor
+# Trading advisor: run on KST schedule (00/04/08/12/16/20)
+make local-advisor-run
+
+# Docker: build image
+make docker-build
+
+# Docker: run scheduled advisor and persist logs to ./logs/advisor.log
+make docker-run
+
+# Docker: run once and persist logs to ./logs/advisor.log
+make docker-test
 ```
 
 ## Advisor Output (Current)
 
 - Target: NVDA
-- Frequency: hourly
+- Frequency: KST 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
 - Decision: Buy / Sell / Hold percentages
 - Horizons: Daily, Weekly, Monthly, Quarterly, Yearly
 - Indicators: momentum, SMA20/50, RSI14, macro proxies
 - FX display: all USD prices include KRW converted value in parentheses with comma formatting
+
+## Docker Logging
+
+- App logs are written to both stdout and a file.
+- Docker targets mount host `./logs` to container `/app/logs`.
+- Default log file path in Docker: `/app/logs/advisor.log`.
 
 ## Data Sources
 
