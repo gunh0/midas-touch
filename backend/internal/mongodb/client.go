@@ -27,6 +27,8 @@ type Client struct {
 // CandleDoc represents a single OHLCV candle stored in MongoDB.
 type CandleDoc struct {
 	Symbol    string    `bson:"symbol"    json:"symbol"`
+	Timeframe string    `bson:"timeframe" json:"timeframe"`
+	Source    string    `bson:"source"    json:"source"`
 	Timestamp time.Time `bson:"timestamp" json:"timestamp"`
 	Open      float64   `bson:"open"      json:"open"`
 	High      float64   `bson:"high"      json:"high"`
@@ -49,8 +51,13 @@ type SignalDoc struct {
 
 // WatchlistItem is a user-registered symbol.
 type WatchlistItem struct {
-	Symbol    string    `bson:"symbol"     json:"symbol"`
-	AddedAt   time.Time `bson:"added_at"   json:"added_at"`
+	Symbol             string     `bson:"symbol" json:"symbol"`
+	AddedAt            time.Time  `bson:"added_at" json:"added_at"`
+	NotifyIntervalHour int        `bson:"notify_interval_hour" json:"notify_interval_hour"`
+	Pinned             bool       `bson:"pinned" json:"pinned"`
+	SortOrder          int        `bson:"sort_order" json:"sort_order"`
+	LastNotifiedAt     *time.Time `bson:"last_notified_at,omitempty" json:"last_notified_at,omitempty"`
+	LastSpecialAt      *time.Time `bson:"last_special_at,omitempty" json:"last_special_at,omitempty"`
 }
 
 // DBStats holds storage usage info.
@@ -89,7 +96,13 @@ func (c *Client) UpsertCandles(ctx context.Context, candles []CandleDoc) error {
 	col := c.db.Collection(candlesCol)
 	models := make([]mongo.WriteModel, 0, len(candles))
 	for _, cd := range candles {
-		filter := bson.D{{Key: "symbol", Value: cd.Symbol}, {Key: "timestamp", Value: cd.Timestamp}}
+		if cd.Timeframe == "" {
+			cd.Timeframe = "1d"
+		}
+		if cd.Source == "" {
+			cd.Source = "unknown"
+		}
+		filter := bson.D{{Key: "symbol", Value: cd.Symbol}, {Key: "timeframe", Value: cd.Timeframe}, {Key: "timestamp", Value: cd.Timestamp}}
 		update := bson.D{{Key: "$set", Value: cd}}
 		models = append(models, mongo.NewUpdateOneModel().SetFilter(filter).SetUpdate(update).SetUpsert(true))
 	}
@@ -97,10 +110,13 @@ func (c *Client) UpsertCandles(ctx context.Context, candles []CandleDoc) error {
 	return err
 }
 
-func (c *Client) GetCandles(ctx context.Context, symbol string, limit int) ([]CandleDoc, error) {
+func (c *Client) GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]CandleDoc, error) {
 	col := c.db.Collection(candlesCol)
 	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: -1}}).SetLimit(int64(limit))
-	cursor, err := col.Find(ctx, bson.D{{Key: "symbol", Value: symbol}}, opts)
+	if timeframe == "" {
+		timeframe = "1d"
+	}
+	cursor, err := col.Find(ctx, bson.D{{Key: "symbol", Value: symbol}, {Key: "timeframe", Value: timeframe}}, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -117,10 +133,14 @@ func (c *Client) GetCandles(ctx context.Context, symbol string, limit int) ([]Ca
 	return docs, nil
 }
 
-func (c *Client) PruneOldCandles(ctx context.Context, symbol string, keepDays int) (int64, error) {
+func (c *Client) PruneOldCandles(ctx context.Context, symbol, timeframe string, keepDays int) (int64, error) {
 	cutoff := time.Now().AddDate(0, 0, -keepDays)
+	if timeframe == "" {
+		timeframe = "1d"
+	}
 	filter := bson.D{
 		{Key: "symbol", Value: symbol},
+		{Key: "timeframe", Value: timeframe},
 		{Key: "timestamp", Value: bson.D{{Key: "$lt", Value: cutoff}}},
 	}
 	res, err := c.db.Collection(candlesCol).DeleteMany(ctx, filter)
@@ -155,13 +175,64 @@ func (c *Client) GetRecentSignals(ctx context.Context, symbol string, limit int)
 
 // ── Watchlist ──────────────────────────────────────────────────────────────
 
-// AddToWatchlist adds a symbol (upsert — no duplicates).
-func (c *Client) AddToWatchlist(ctx context.Context, symbol string) error {
+// AddToWatchlist adds a symbol (upsert — no duplicates) and updates notify interval.
+func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyIntervalHour int) error {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if notifyIntervalHour <= 0 {
+		notifyIntervalHour = 4
+	}
+	order, err := c.nextWatchlistOrder(ctx)
+	if err != nil {
+		return err
+	}
 	filter := bson.D{{Key: "symbol", Value: symbol}}
-	update := bson.D{{Key: "$setOnInsert", Value: WatchlistItem{Symbol: symbol, AddedAt: time.Now()}}}
+	update := bson.D{
+		{Key: "$setOnInsert", Value: WatchlistItem{Symbol: symbol, AddedAt: time.Now(), Pinned: false, SortOrder: order}},
+		{Key: "$set", Value: bson.D{{Key: "notify_interval_hour", Value: notifyIntervalHour}}},
+	}
 	opts := options.UpdateOne().SetUpsert(true)
-	_, err := c.db.Collection(watchlistCol).UpdateOne(ctx, filter, update, opts)
+	_, err = c.db.Collection(watchlistCol).UpdateOne(ctx, filter, update, opts)
+	return err
+}
+
+func (c *Client) SetWatchlistPinned(ctx context.Context, symbol string, pinned bool) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	_, err := c.db.Collection(watchlistCol).UpdateOne(
+		ctx,
+		bson.D{{Key: "symbol", Value: symbol}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "pinned", Value: pinned}}}},
+	)
+	return err
+}
+
+func (c *Client) ReorderWatchlist(ctx context.Context, symbols []string) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+	models := make([]mongo.WriteModel, 0, len(symbols))
+	for i, sym := range symbols {
+		norm := strings.ToUpper(strings.TrimSpace(sym))
+		if norm == "" {
+			continue
+		}
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "symbol", Value: norm}}).
+			SetUpdate(bson.D{{Key: "$set", Value: bson.D{{Key: "sort_order", Value: i}}}}))
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	_, err := c.db.Collection(watchlistCol).BulkWrite(ctx, models)
+	return err
+}
+
+func (c *Client) MarkWatchlistNotified(ctx context.Context, symbol string, special bool, at time.Time) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	set := bson.D{{Key: "last_notified_at", Value: at}}
+	if special {
+		set = append(set, bson.E{Key: "last_special_at", Value: at})
+	}
+	_, err := c.db.Collection(watchlistCol).UpdateOne(ctx, bson.D{{Key: "symbol", Value: symbol}}, bson.D{{Key: "$set", Value: set}})
 	return err
 }
 
@@ -174,7 +245,7 @@ func (c *Client) RemoveFromWatchlist(ctx context.Context, symbol string) error {
 
 // GetWatchlist returns all saved symbols sorted alphabetically.
 func (c *Client) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
-	opts := options.Find().SetSort(bson.D{{Key: "symbol", Value: 1}})
+	opts := options.Find().SetSort(bson.D{{Key: "pinned", Value: -1}, {Key: "sort_order", Value: 1}, {Key: "symbol", Value: 1}})
 	cursor, err := c.db.Collection(watchlistCol).Find(ctx, bson.D{}, opts)
 	if err != nil {
 		return nil, err
@@ -185,7 +256,28 @@ func (c *Client) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 	if err := cursor.All(ctx, &items); err != nil {
 		return nil, err
 	}
+	for i := range items {
+		if items[i].NotifyIntervalHour <= 0 {
+			items[i].NotifyIntervalHour = 4
+		}
+		if items[i].SortOrder <= 0 {
+			items[i].SortOrder = i
+		}
+	}
 	return items, nil
+}
+
+func (c *Client) nextWatchlistOrder(ctx context.Context) (int, error) {
+	opts := options.FindOne().SetSort(bson.D{{Key: "sort_order", Value: -1}})
+	var last WatchlistItem
+	err := c.db.Collection(watchlistCol).FindOne(ctx, bson.D{}, opts).Decode(&last)
+	if err == mongo.ErrNoDocuments {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last.SortOrder + 1, nil
 }
 
 // ── DB Stats ───────────────────────────────────────────────────────────────

@@ -1,0 +1,171 @@
+basePath: /
+definitions:
+  api.SourceStatus:
+    properties:
+      checked_at:
+        type: string
+      detail:
+        type: string
+      error:
+        type: string
+      latency_ms:
+        type: integer
+      ok:
+        type: boolean
+      score:
+        type: number
+      source:
+        type: string
+    type: object
+  mongodb.CandleDoc:
+    properties:
+      close:
+        type: number
+      high:
+        type: number
+      low:
+        type: number
+      open:
+        type: number
+      source:
+        type: string
+      symbol:
+        type: string
+      timeframe:
+        type: string
+      timestamp:
+        type: string
+      volume:
+        type: number
+    type: object
+info:
+  contact: {}
+  description: Multi-timeframe signal API (daily direction + intraday timing)
+  title: Midas Touch API
+  version: "1.0"
+paths:
+  /api/candles:
+    get:
+      parameters:
+      - default: NVDA
+        description: Ticker symbol
+        in: query
+        name: symbol
+        type: string
+      - default: 1d
+        description: 1d,5,15,30,60,120,240
+        in: query
+        name: timeframe
+        type: string
+      - default: 300
+        description: rows
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/mongodb.CandleDoc'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get candles
+      tags:
+      - market
+  /api/health:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Health check
+      tags:
+      - system
+  /api/notify:
+    post:
+      parameters:
+      - default: NVDA
+        description: Ticker symbol
+        in: query
+        name: symbol
+        type: string
+      - default: "120"
+        description: 60,120,240
+        in: query
+        name: timing_tf
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Evaluate and send Telegram signal
+      tags:
+      - signal
+  /api/signal:
+    get:
+      parameters:
+      - default: NVDA
+        description: Ticker symbol
+        in: query
+        name: symbol
+        type: string
+      - default: "120"
+        description: 60,120,240
+        in: query
+        name: timing_tf
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Evaluate a signal
+      tags:
+      - signal
+  /api/sources/status:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/api.SourceStatus'
+            type: array
+      summary: External data source status
+      tags:
+      - system
+swagger: "2.0"

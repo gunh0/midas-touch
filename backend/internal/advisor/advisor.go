@@ -50,11 +50,16 @@ type Recommendation struct {
 	SellPercent  float64
 	HoldPercent  float64
 	Action       string
+	TrendAction  string
+	TimingAction string
+	IsSpecial    bool
 	Reason       string
 	USDKRWRate   float64
 	Snapshot     map[string]marketdata.Quote
 	Indicators   Indicators
+	Timing       Indicators
 	Score        SignalScore
+	TimingScore  SignalScore
 	Timestamp    time.Time
 }
 
@@ -81,10 +86,74 @@ func Evaluate(symbol string, snapshot map[string]marketdata.Quote, closes []floa
 		SellPercent:  sell,
 		HoldPercent:  hold,
 		Action:       action,
+		TrendAction:  action,
+		TimingAction: action,
 		Reason:       strings.Join(reasons, "; "),
 		Snapshot:     snapshot,
 		Indicators:   ind,
+		Timing:       ind,
 		Score:        score,
+		TimingScore:  score,
+		Timestamp:    now,
+	}, nil
+}
+
+// EvaluateMultiTimeframe computes final probabilities from:
+// - daily closes: direction
+// - intraday closes: timing
+func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote, dailyCloses, intradayCloses []float64, now time.Time) (Recommendation, error) {
+	if len(dailyCloses) < 50 {
+		return Recommendation{}, fmt.Errorf("need at least 50 daily closes, got %d", len(dailyCloses))
+	}
+	if len(intradayCloses) < 50 {
+		return Recommendation{}, fmt.Errorf("need at least 50 intraday closes, got %d", len(intradayCloses))
+	}
+
+	dailyInd := computeIndicators(dailyCloses)
+	dailyScore, dailyReasons := scoreFromIndicators(dailyInd, dailyCloses)
+	dBuy, dSell, dHold := toProbabilities(dailyScore.Total)
+	trendAction := dominantAction(dBuy, dSell, dHold)
+
+	timingInd := computeIndicators(intradayCloses)
+	timingScore, timingReasons := scoreFromIndicators(timingInd, intradayCloses)
+	tBuy, tSell, tHold := toProbabilities(timingScore.Total)
+	timingAction := dominantAction(tBuy, tSell, tHold)
+
+	finalScore := dailyScore.Total*0.65 + timingScore.Total*0.35
+	buy, sell, hold := toProbabilities(finalScore)
+	action := dominantAction(buy, sell, hold)
+
+	isSpecial := false
+	if (dailyScore.Total >= 0.55 && timingScore.Total >= 0.65) ||
+		(dailyScore.Total <= -0.55 && timingScore.Total <= -0.65) {
+		isSpecial = true
+	}
+
+	reason := fmt.Sprintf(
+		"Direction(daily): %s | Timing(intraday): %s | daily=%.2f intraday=%.2f; daily details: %s; intraday details: %s",
+		trendAction,
+		timingAction,
+		dailyScore.Total,
+		timingScore.Total,
+		strings.Join(dailyReasons, ", "),
+		strings.Join(timingReasons, ", "),
+	)
+
+	return Recommendation{
+		TargetSymbol: symbol,
+		BuyPercent:   buy,
+		SellPercent:  sell,
+		HoldPercent:  hold,
+		Action:       action,
+		TrendAction:  trendAction,
+		TimingAction: timingAction,
+		IsSpecial:    isSpecial,
+		Reason:       reason,
+		Snapshot:     snapshot,
+		Indicators:   dailyInd,
+		Timing:       timingInd,
+		Score:        dailyScore,
+		TimingScore:  timingScore,
 		Timestamp:    now,
 	}, nil
 }
@@ -250,23 +319,25 @@ func FormatMessage(r Recommendation) string {
 	targetQuote := r.Snapshot[r.TargetSymbol]
 
 	return fmt.Sprintf(
-		"Midas Touch Signal\n"+
-			"Time: %s\n\n"+
+		"Midas Touch Signal (시그널)\n"+
+			"Time(시간): %s\n\n"+
 			"[%s] %s\n"+
-			"Buy: %.0f%% | Hold: %.0f%% | Sell: %.0f%%\n\n"+
-			"Indicators\n"+
+			"Direction(방향 D): %s | Timing(타이밍 H): %s\n"+
+			"Buy(상승): %.0f%% | Hold(횡보): %.0f%% | Sell(하락): %.0f%%\n\n"+
+			"Indicators(지표)\n"+
 			"- RSI14: %.1f\n"+
 			"- SMA20: %.2f | SMA50: %.2f\n"+
 			"- BB: %.2f / %.2f / %.2f\n"+
 			"- Supertrend: %s (%.2f)\n"+
 			"- ATR14: %.2f\n\n"+
-			"Market\n"+
+			"Market(시장)\n"+
 			"- %s: $%.2f (%+.2f%%)\n"+
 			"- VIX: %+.2f%% | NQ: %+.2f%%\n"+
 			"- USD/KRW: %.2f\n\n"+
-			"Reason: %s",
+			"Reason(근거): %s",
 		r.Timestamp.Format("2006-01-02 15:04 KST"),
 		r.TargetSymbol, r.Action,
+		r.TrendAction, r.TimingAction,
 		r.BuyPercent, r.HoldPercent, r.SellPercent,
 		r.Indicators.RSI14,
 		r.Indicators.SMA20, r.Indicators.SMA50,

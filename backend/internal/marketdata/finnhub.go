@@ -3,16 +3,20 @@ package marketdata
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
 const (
 	finnhubQuoteAPI = "https://finnhub.io/api/v1/quote"
+	finnhubCandleAPI = "https://finnhub.io/api/v1/stock/candle"
 	usdkrwRateAPI   = "https://api.frankfurter.app/latest?from=USD&to=KRW"
 	yahooChartAPI   = "https://query1.finance.yahoo.com/v8/finance/chart/"
+	yahooSearchAPI  = "https://query2.finance.yahoo.com/v1/finance/search"
 )
 
 type Client struct {
@@ -35,6 +39,13 @@ type OHLCVBar struct {
 	Low       float64
 	Close     float64
 	Volume    float64
+}
+
+type SymbolSearchResult struct {
+	Symbol      string `json:"symbol"`
+	Name        string `json:"name"`
+	Exchange    string `json:"exchange"`
+	TypeDisplay string `json:"type_display"`
 }
 
 type finnhubQuoteResponse struct {
@@ -66,6 +77,26 @@ type yahooChartResponse struct {
 			Description string `json:"description"`
 		} `json:"error"`
 	} `json:"chart"`
+}
+
+type finnhubCandleResponse struct {
+	Status     string    `json:"s"`
+	Timestamp  []int64   `json:"t"`
+	Open       []float64 `json:"o"`
+	High       []float64 `json:"h"`
+	Low        []float64 `json:"l"`
+	Close      []float64 `json:"c"`
+	Volume     []float64 `json:"v"`
+}
+
+type yahooSearchResponse struct {
+	Quotes []struct {
+		Symbol   string `json:"symbol"`
+		Short    string `json:"shortname"`
+		Long     string `json:"longname"`
+		Exchange string `json:"exchange"`
+		TypeDisp string `json:"quoteType"`
+	} `json:"quotes"`
 }
 
 func NewClient() *Client {
@@ -249,6 +280,391 @@ func (c *Client) FetchDailyBars(symbol string, lookbackDays int) ([]OHLCVBar, er
 	}
 
 	return bars, nil
+}
+
+// FetchIntradayBars fetches short-term bars from Finnhub.
+// resolution supports "5", "15", "30", "60", "120", "240" (minutes).
+func (c *Client) FetchIntradayBars(symbol, resolution string, lookbackBars int) ([]OHLCVBar, error) {
+	if lookbackBars <= 0 {
+		return nil, fmt.Errorf("lookbackBars must be positive")
+	}
+
+	res := normalizeResolution(resolution)
+
+	minutesPerBar := resolutionMinutes(res)
+	if minutesPerBar <= 0 {
+		return nil, fmt.Errorf("unsupported resolution %q", resolution)
+	}
+
+	// Prefer Finnhub for intraday, then gracefully fallback to Yahoo when unavailable (e.g., 403 plan limits).
+	if c.apiKey != "" {
+		if bars, err := c.fetchFinnhubIntradayBars(symbol, res, lookbackBars); err == nil {
+			return bars, nil
+		}
+	}
+
+	if bars, err := c.fetchYahooIntradayBars(symbol, res, lookbackBars); err == nil {
+		return bars, nil
+	}
+
+	return nil, fmt.Errorf("unable to fetch intraday bars for %s (%s) from finnhub and yahoo", symbol, res)
+}
+
+func (c *Client) fetchFinnhubIntradayBars(symbol, resolution string, lookbackBars int) ([]OHLCVBar, error) {
+	providerSymbol := toFinnhubSymbol(symbol)
+	minutesPerBar := resolutionMinutes(resolution)
+
+	toTs := time.Now().Unix()
+	fromTs := time.Now().Add(-time.Duration(lookbackBars*minutesPerBar+minutesPerBar*8) * time.Minute).Unix()
+
+	reqURL, err := url.Parse(finnhubCandleAPI)
+	if err != nil {
+		return nil, fmt.Errorf("parse finnhub candle url: %w", err)
+	}
+	q := reqURL.Query()
+	q.Set("symbol", providerSymbol)
+	q.Set("resolution", resolution)
+	q.Set("from", fmt.Sprintf("%d", fromTs))
+	q.Set("to", fmt.Sprintf("%d", toTs))
+	q.Set("token", c.apiKey)
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build finnhub candle request: %w", err)
+	}
+	req.Header.Set("User-Agent", "midas-touch/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request finnhub candle api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("finnhub candle api returned status %d", resp.StatusCode)
+	}
+
+	var decoded finnhubCandleResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode finnhub candle response: %w", err)
+	}
+	if decoded.Status != "ok" {
+		return nil, fmt.Errorf("finnhub candle status=%s", decoded.Status)
+	}
+
+	n := len(decoded.Timestamp)
+	if n == 0 {
+		return nil, fmt.Errorf("finnhub candle returned no bars")
+	}
+
+	bars := make([]OHLCVBar, 0, n)
+	for i := 0; i < n; i++ {
+		if i >= len(decoded.Close) || decoded.Close[i] <= 0 {
+			continue
+		}
+		bar := OHLCVBar{
+			Timestamp: time.Unix(decoded.Timestamp[i], 0).UTC(),
+			Close:     decoded.Close[i],
+		}
+		if i < len(decoded.Open) {
+			bar.Open = decoded.Open[i]
+		}
+		if i < len(decoded.High) {
+			bar.High = decoded.High[i]
+		}
+		if i < len(decoded.Low) {
+			bar.Low = decoded.Low[i]
+		}
+		if i < len(decoded.Volume) {
+			bar.Volume = decoded.Volume[i]
+		}
+		bars = append(bars, bar)
+	}
+
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("finnhub candle returned no valid bars")
+	}
+	if len(bars) > lookbackBars {
+		bars = bars[len(bars)-lookbackBars:]
+	}
+
+	return bars, nil
+}
+
+func (c *Client) fetchYahooIntradayBars(symbol, resolution string, lookbackBars int) ([]OHLCVBar, error) {
+	yahooSymbol := toYahooSymbol(symbol)
+	baseInterval := yahooIntervalForResolution(resolution)
+	if baseInterval == "" {
+		return nil, fmt.Errorf("unsupported resolution for yahoo intraday: %s", resolution)
+	}
+
+	rangeParam := yahooIntradayRange(resolution, lookbackBars)
+	reqURL, err := url.Parse(yahooChartAPI + yahooSymbol)
+	if err != nil {
+		return nil, fmt.Errorf("parse yahoo intraday url: %w", err)
+	}
+	q := reqURL.Query()
+	q.Set("interval", baseInterval)
+	q.Set("range", rangeParam)
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build yahoo intraday request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request yahoo intraday api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("yahoo intraday api returned status %d", resp.StatusCode)
+	}
+
+	var decoded yahooChartResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode yahoo intraday response: %w", err)
+	}
+	if decoded.Chart.Error != nil {
+		return nil, fmt.Errorf("yahoo intraday error: %s - %s", decoded.Chart.Error.Code, decoded.Chart.Error.Description)
+	}
+	if len(decoded.Chart.Result) == 0 || len(decoded.Chart.Result[0].Indicators.Quote) == 0 {
+		return nil, fmt.Errorf("yahoo intraday returned empty result")
+	}
+
+	result := decoded.Chart.Result[0]
+	quote := result.Indicators.Quote[0]
+	raw := make([]OHLCVBar, 0, len(result.Timestamp))
+	for i := 0; i < len(result.Timestamp); i++ {
+		if i >= len(quote.Close) || quote.Close[i] <= 0 {
+			continue
+		}
+		b := OHLCVBar{Timestamp: time.Unix(result.Timestamp[i], 0).UTC(), Close: quote.Close[i]}
+		if i < len(quote.Open) {
+			b.Open = quote.Open[i]
+		}
+		if i < len(quote.High) {
+			b.High = quote.High[i]
+		}
+		if i < len(quote.Low) {
+			b.Low = quote.Low[i]
+		}
+		if i < len(quote.Volume) {
+			b.Volume = quote.Volume[i]
+		}
+		raw = append(raw, b)
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("yahoo intraday returned no valid bars")
+	}
+
+	baseMinutes := intervalMinutes(baseInterval)
+	targetMinutes := resolutionMinutes(resolution)
+	if baseMinutes <= 0 || targetMinutes <= 0 {
+		return nil, fmt.Errorf("invalid interval mapping")
+	}
+
+	bars := raw
+	if targetMinutes > baseMinutes {
+		factor := targetMinutes / baseMinutes
+		if factor > 1 {
+			bars = aggregateBars(raw, factor)
+		}
+	}
+
+	if len(bars) > lookbackBars {
+		bars = bars[len(bars)-lookbackBars:]
+	}
+	return bars, nil
+}
+
+func aggregateBars(src []OHLCVBar, factor int) []OHLCVBar {
+	if factor <= 1 || len(src) == 0 {
+		return src
+	}
+	out := make([]OHLCVBar, 0, int(math.Ceil(float64(len(src))/float64(factor))))
+	for i := 0; i < len(src); i += factor {
+		end := i + factor
+		if end > len(src) {
+			end = len(src)
+		}
+		chunk := src[i:end]
+		if len(chunk) == 0 {
+			continue
+		}
+		bar := OHLCVBar{
+			Timestamp: chunk[0].Timestamp,
+			Open:      chunk[0].Open,
+			High:      chunk[0].High,
+			Low:       chunk[0].Low,
+			Close:     chunk[len(chunk)-1].Close,
+		}
+		for _, c := range chunk {
+			if c.High > bar.High {
+				bar.High = c.High
+			}
+			if bar.Low == 0 || (c.Low > 0 && c.Low < bar.Low) {
+				bar.Low = c.Low
+			}
+			bar.Volume += c.Volume
+		}
+		out = append(out, bar)
+	}
+	return out
+}
+
+func yahooIntervalForResolution(resolution string) string {
+	switch resolution {
+	case "5":
+		return "5m"
+	case "15":
+		return "15m"
+	case "30":
+		return "30m"
+	case "60", "120", "240":
+		return "60m"
+	default:
+		return ""
+	}
+}
+
+func yahooIntradayRange(resolution string, lookbackBars int) string {
+	totalMinutes := resolutionMinutes(resolution) * lookbackBars
+	switch {
+	case totalMinutes <= 24*60:
+		return "1d"
+	case totalMinutes <= 5*24*60:
+		return "5d"
+	case totalMinutes <= 30*24*60:
+		return "1mo"
+	case totalMinutes <= 90*24*60:
+		return "3mo"
+	default:
+		return "6mo"
+	}
+}
+
+func intervalMinutes(interval string) int {
+	switch interval {
+	case "5m":
+		return 5
+	case "15m":
+		return 15
+	case "30m":
+		return 30
+	case "60m":
+		return 60
+	default:
+		return 0
+	}
+}
+
+func (c *Client) SearchSymbols(query string, limit int) ([]SymbolSearchResult, error) {
+	qv := strings.TrimSpace(query)
+	if qv == "" {
+		return []SymbolSearchResult{}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+
+	reqURL, err := url.Parse(yahooSearchAPI)
+	if err != nil {
+		return nil, fmt.Errorf("parse yahoo search url: %w", err)
+	}
+	q := reqURL.Query()
+	q.Set("q", qv)
+	q.Set("quotesCount", fmt.Sprintf("%d", limit*2))
+	q.Set("newsCount", "0")
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build yahoo search request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request yahoo search api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("yahoo search api returned status %d", resp.StatusCode)
+	}
+
+	var decoded yahooSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode yahoo search response: %w", err)
+	}
+
+	results := make([]SymbolSearchResult, 0, limit)
+	for _, item := range decoded.Quotes {
+		if item.Symbol == "" {
+			continue
+		}
+		name := item.Long
+		if name == "" {
+			name = item.Short
+		}
+		results = append(results, SymbolSearchResult{
+			Symbol:      strings.ToUpper(item.Symbol),
+			Name:        name,
+			Exchange:    item.Exchange,
+			TypeDisplay: item.TypeDisp,
+		})
+		if len(results) >= limit {
+			break
+		}
+	}
+
+	return results, nil
+}
+
+func normalizeResolution(resolution string) string {
+	r := strings.TrimSpace(strings.ToLower(resolution))
+	switch r {
+	case "5", "5m", "m5":
+		return "5"
+	case "15", "15m", "m15":
+		return "15"
+	case "30", "30m", "m30":
+		return "30"
+	case "60", "1h", "h1":
+		return "60"
+	case "120", "2h", "h2":
+		return "120"
+	case "240", "4h", "h4":
+		return "240"
+	default:
+		return resolution
+	}
+}
+
+func resolutionMinutes(resolution string) int {
+	switch resolution {
+	case "5":
+		return 5
+	case "15":
+		return 15
+	case "30":
+		return 30
+	case "60":
+		return 60
+	case "120":
+		return 120
+	case "240":
+		return 240
+	default:
+		return 0
+	}
 }
 
 func (c *Client) fetchFinnhubQuote(symbol string) (finnhubQuoteResponse, error) {
