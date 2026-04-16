@@ -131,8 +131,8 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 
 	reason := fmt.Sprintf(
 		"Direction(daily): %s | Timing(intraday): %s | daily=%.2f intraday=%.2f; daily details: %s; intraday details: %s",
-		trendAction,
-		timingAction,
+		actionWithKorean(trendAction),
+		actionWithKorean(timingAction),
 		dailyScore.Total,
 		timingScore.Total,
 		strings.Join(dailyReasons, ", "),
@@ -303,9 +303,9 @@ func dominantAction(buy, sell, hold float64) string {
 
 // FormatMessage formats a Recommendation for Telegram.
 func FormatMessage(r Recommendation) string {
-	stDir := "Bullish"
+	stDir := "Bullish(상승)"
 	if r.Indicators.SupertrendDir < 0 {
-		stDir = "Bearish"
+		stDir = "Bearish(하락)"
 	}
 
 	// Best-effort market context from snapshot
@@ -336,8 +336,8 @@ func FormatMessage(r Recommendation) string {
 			"- USD/KRW: %.2f\n\n"+
 			"Reason(근거): %s",
 		r.Timestamp.Format("2006-01-02 15:04 KST"),
-		r.TargetSymbol, r.Action,
-		r.TrendAction, r.TimingAction,
+		r.TargetSymbol, actionWithKorean(r.Action),
+		actionWithKorean(r.TrendAction), actionWithKorean(r.TimingAction),
 		r.BuyPercent, r.HoldPercent, r.SellPercent,
 		r.Indicators.RSI14,
 		r.Indicators.SMA20, r.Indicators.SMA50,
@@ -349,6 +349,22 @@ func FormatMessage(r Recommendation) string {
 		r.USDKRWRate,
 		r.Reason,
 	)
+}
+
+func actionWithKorean(action string) string {
+	switch strings.ToUpper(strings.TrimSpace(action)) {
+	case "BUY":
+		return "BUY(구매)"
+	case "SELL":
+		return "SELL(매도)"
+	case "HOLD":
+		return "HOLD(관망)"
+	default:
+		if action == "" {
+			return "HOLD(관망)"
+		}
+		return action
+	}
 }
 
 // ── Technical indicator calculations ──────────────────────────────────────
