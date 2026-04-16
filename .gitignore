@@ -1,2 +1,23 @@
-*.env
+# macOS
+.DS_Store
+
+# Secrets
+.env
 *.log
+
+# LLM notes
+llm.md
+
+# Go
+backend/vendor/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+backend/frontend/
+
+# Docker
+logs/
+data/

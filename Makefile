@@ -1,24 +1,30 @@
-.PHONY: local-notify-test local-advisor-run local-advisor-test local-test advisor advisor-test docker-build docker-run docker-test
+.PHONY: dev dev-front dev-back build stop logs deploy
 
-local-notify-test:
+# ── Local development ──────────────────────────────────────────────────────
+dev:
+	docker compose up --build
+
+stop:
+	docker compose down
+
+logs:
+	docker compose logs -f
+
+# Run backend locally (port 8080)
+dev-back:
 	@set -a; source .env; set +a; \
-	go run ./cmd/notify/...
+	cd backend && go run ./cmd/advisor/...
 
-local-advisor-test:
-	@set -a; source .env; set +a; \
-	ADVISOR_RUN_ONCE=true go run ./cmd/advisor/...
+# Run frontend locally (port 3000)
+dev-front:
+	npm run dev --prefix frontend
 
-local-test: local-notify-test
+# ── Docker images ──────────────────────────────────────────────────────────
+build:
+	docker compose build
 
-advisor-test: local-advisor-test
-
-docker-build:
-	docker build -t midas-touch .
-
-docker-run: docker-build
-	mkdir -p logs
-	docker run --env-file .env -e ADVISOR_LOG_FILE=/app/logs/advisor.log -v "$(PWD)/logs:/app/logs" midas-touch
-
-docker-test: docker-build
-	mkdir -p logs
-	docker run --env-file .env -e ADVISOR_RUN_ONCE=true -e ADVISOR_LOG_FILE=/app/logs/advisor.log -v "$(PWD)/logs:/app/logs" midas-touch
+# ── Deploy (run this on the remote server after git clone) ─────────────────
+deploy:
+	git fetch origin
+	git pull origin main
+	docker compose up -d --build
