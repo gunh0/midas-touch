@@ -38,12 +38,17 @@ interface Score {
 interface Signal {
   symbol: string;
   action: string;
+  trend_action?: string;
+  timing_action?: string;
+  is_special_signal?: boolean;
   buy_pct: number;
   sell_pct: number;
   hold_pct: number;
   reason: string;
   indicators: Indicators;
+  timing_indicators?: Indicators;
   score: Score;
+  timing_score?: Score;
   timestamp: string;
 }
 
@@ -58,6 +63,26 @@ interface DBStats {
 interface WatchlistItem {
   symbol: string;
   added_at: string;
+  notify_interval_hour?: number;
+  pinned?: boolean;
+  sort_order?: number;
+}
+
+interface SymbolSearchResult {
+  symbol: string;
+  name: string;
+  exchange: string;
+  type_display: string;
+}
+
+interface SourceStatus {
+  source: string;
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+  detail?: string;
+  checked_at: string;
+  score: number;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -77,6 +102,15 @@ function actionBg(action: string) {
   if (action === "BUY") return "bg-emerald-500/20 border-emerald-500/40";
   if (action === "SELL") return "bg-red-500/20 border-red-500/40";
   return "bg-yellow-500/20 border-yellow-500/40";
+}
+
+function formatPrice(v: number) {
+  return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatPct(v: number) {
+  const sign = v >= 0 ? "+" : "";
+  return `${sign}${v.toFixed(2)}%`;
 }
 
 // ── Candlestick chart (pure canvas) ───────────────────────────────────────
@@ -215,27 +249,60 @@ function IndicatorRow({ label, value, badge }: { label: string; value: string; b
 }
 
 // ── Watchlist panel ────────────────────────────────────────────────────────
-function WatchlistPanel({ onSelect }: { onSelect: (symbol: string) => void }) {
+function WatchlistPanel({
+  onSelect,
+  onItemsChange,
+}: {
+  onSelect: (symbol: string) => void;
+  onItemsChange?: (items: WatchlistItem[]) => void;
+}) {
   const [items, setItems] = useState<WatchlistItem[]>([]);
   const [input, setInput] = useState("");
+  const [intervalHour, setIntervalHour] = useState(4);
+  const [searching, setSearching] = useState(false);
+  const [results, setResults] = useState<SymbolSearchResult[]>([]);
   const [saving, setSaving] = useState(false);
+  const [draggingSymbol, setDraggingSymbol] = useState<string | null>(null);
 
   const load = async () => {
     try {
       const data = await fetchJSON<WatchlistItem[]>("/api/watchlist");
-      setItems(data ?? []);
+      const next = data ?? [];
+      setItems(next);
+      onItemsChange?.(next);
     } catch { /* ignore */ }
   };
 
   useEffect(() => { load(); }, []);
+
+  useEffect(() => {
+    if (input.trim().length < 2) {
+      setResults([]);
+      return;
+    }
+    const t = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const data = await fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(input.trim())}&limit=8`);
+        setResults(data ?? []);
+      } catch {
+        setResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 250);
+
+    return () => clearTimeout(t);
+  }, [input]);
 
   const add = async () => {
     const sym = input.trim().toUpperCase();
     if (!sym) return;
     setSaving(true);
     try {
-      await fetch(`${API_BASE}/api/watchlist?symbol=${sym}`, { method: "POST" });
+      await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${intervalHour}`, { method: "POST" });
       setInput("");
+      setResults([]);
       await load();
     } finally {
       setSaving(false);
@@ -247,6 +314,42 @@ function WatchlistPanel({ onSelect }: { onSelect: (symbol: string) => void }) {
     await load();
   };
 
+  const updateInterval = async (sym: string, nextHour: number) => {
+    await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${nextHour}`, { method: "POST" });
+    await load();
+  };
+
+  const togglePin = async (item: WatchlistItem) => {
+    const nextPinned = !(item.pinned ?? false);
+    await fetch(`${API_BASE}/api/watchlist/pin?symbol=${item.symbol}&pinned=${nextPinned}`, { method: "POST" });
+    await load();
+  };
+
+  const reorder = async (fromSym: string, toSym: string) => {
+    if (!fromSym || !toSym || fromSym === toSym) return;
+
+    const fromIdx = items.findIndex((x) => x.symbol === fromSym);
+    const toIdx = items.findIndex((x) => x.symbol === toSym);
+    if (fromIdx < 0 || toIdx < 0) return;
+
+    const next = [...items];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(toIdx, 0, moved);
+
+    setItems(next);
+    onItemsChange?.(next);
+
+    const symbols = next.map((x) => x.symbol);
+    const res = await fetch(`${API_BASE}/api/watchlist/reorder`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbols }),
+    });
+    if (!res.ok) {
+      await load();
+    }
+  };
+
   return (
     <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
       <h3 className="text-sm font-semibold text-slate-300 mb-3">Watchlist</h3>
@@ -254,11 +357,22 @@ function WatchlistPanel({ onSelect }: { onSelect: (symbol: string) => void }) {
         <input
           type="text"
           value={input}
-          onChange={(e) => setInput(e.target.value.toUpperCase())}
+          onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && add()}
-          placeholder="Add symbol..."
+          placeholder="Add symbol or name..."
           className="flex-1 px-2 py-1.5 bg-slate-700 border border-slate-600 text-white text-xs rounded focus:outline-none focus:border-indigo-500"
         />
+        <select
+          value={intervalHour}
+          onChange={(e) => setIntervalHour(Number(e.target.value))}
+          className="px-2 py-1.5 bg-slate-700 border border-slate-600 text-white text-xs rounded focus:outline-none focus:border-indigo-500"
+        >
+          <option value={1}>1h</option>
+          <option value={2}>2h</option>
+          <option value={4}>4h</option>
+          <option value={6}>6h</option>
+          <option value={12}>12h</option>
+        </select>
         <button
           onClick={add}
           disabled={saving}
@@ -267,18 +381,69 @@ function WatchlistPanel({ onSelect }: { onSelect: (symbol: string) => void }) {
           Add
         </button>
       </div>
+      {searching && <p className="text-[11px] text-slate-500 mb-2">Searching symbols...</p>}
+      {results.length > 0 && (
+        <div className="mb-3 max-h-36 overflow-auto border border-slate-700 rounded-lg">
+          {results.map((row) => (
+            <button
+              key={`${row.symbol}-${row.exchange}`}
+              onClick={() => setInput(row.symbol)}
+              className="w-full text-left px-2 py-1.5 hover:bg-slate-700/60 transition-colors border-b border-slate-800 last:border-b-0"
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono text-indigo-300">{row.symbol}</span>
+                <span className="text-[10px] text-slate-500">{row.exchange}</span>
+              </div>
+              <p className="text-[11px] text-slate-400 truncate">{row.name || row.type_display}</p>
+            </button>
+          ))}
+        </div>
+      )}
       {items.length === 0 ? (
         <p className="text-xs text-slate-500 text-center py-2">No symbols saved</p>
       ) : (
         <div className="space-y-1">
           {items.map((item) => (
-            <div key={item.symbol} className="flex items-center justify-between group">
-              <button
-                onClick={() => onSelect(item.symbol)}
-                className="text-sm font-mono text-indigo-400 hover:text-indigo-300 transition-colors"
-              >
-                {item.symbol}
-              </button>
+            <div
+              key={item.symbol}
+              draggable
+              onDragStart={() => setDraggingSymbol(item.symbol)}
+              onDragEnd={() => setDraggingSymbol(null)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={async () => {
+                const from = draggingSymbol;
+                setDraggingSymbol(null);
+                if (from) await reorder(from, item.symbol);
+              }}
+              className={`flex items-center justify-between group rounded px-1 ${draggingSymbol === item.symbol ? "opacity-50" : ""}`}
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-500 cursor-grab select-none" title="Drag to reorder">⋮⋮</span>
+                <button
+                  onClick={() => togglePin(item)}
+                  className={`text-xs transition-colors ${item.pinned ? "text-amber-300" : "text-slate-500 hover:text-amber-300"}`}
+                  title={item.pinned ? "Unpin" : "Pin"}
+                >
+                  {item.pinned ? "★" : "☆"}
+                </button>
+                <button
+                  onClick={() => onSelect(item.symbol)}
+                  className="text-sm font-mono text-indigo-400 hover:text-indigo-300 transition-colors"
+                >
+                  {item.symbol}
+                </button>
+                <select
+                  value={item.notify_interval_hour ?? 4}
+                  onChange={(e) => updateInterval(item.symbol, Number(e.target.value))}
+                  className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-300"
+                >
+                  <option value={1}>1h</option>
+                  <option value={2}>2h</option>
+                  <option value={4}>4h</option>
+                  <option value={6}>6h</option>
+                  <option value={12}>12h</option>
+                </select>
+              </div>
               <button
                 onClick={() => remove(item.symbol)}
                 className="text-xs text-slate-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
@@ -365,11 +530,179 @@ function DBStatsPanel() {
   );
 }
 
+function SourceStatusPanel() {
+  const [rows, setRows] = useState<SourceStatus[]>([]);
+
+  const load = async () => {
+    try {
+      const data = await fetchJSON<SourceStatus[]>("/api/sources/status");
+      setRows(data ?? []);
+    } catch {
+      setRows([]);
+    }
+  };
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const badgeClass = (r: SourceStatus) => {
+    if (r.ok) return "bg-emerald-500/20 border-emerald-500/40 text-emerald-300";
+    if ((r.error ?? "").includes("403")) return "bg-yellow-500/20 border-yellow-500/40 text-yellow-300";
+    return "bg-red-500/20 border-red-500/40 text-red-300";
+  };
+
+  return (
+    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
+      <h3 className="text-sm font-semibold text-slate-300 mb-3">Data Source Status</h3>
+      {rows.length === 0 ? (
+        <p className="text-xs text-slate-500">No status data</p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((r) => (
+            <div key={r.source} className="rounded-lg border border-slate-700 p-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono text-slate-200">{r.source}</span>
+                <span className={`text-[10px] px-2 py-0.5 rounded border ${badgeClass(r)}`}>
+                  {r.ok ? "OK" : "ISSUE"}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">{r.detail} • {r.latency_ms}ms</p>
+              {r.error && <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{r.error}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Hourly7DayPanel({ symbol, candles }: { symbol: string; candles: CandleDoc[] }) {
+  const latest = candles[candles.length - 1];
+  const base24h = candles.length > 24 ? candles[candles.length - 25] : undefined;
+  const currentPrice = latest?.close ?? 0;
+  const change24hPct = base24h && base24h.close > 0 ? ((currentPrice - base24h.close) / base24h.close) * 100 : 0;
+
+  const last24 = candles.slice(-24).reverse();
+
+  return (
+    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="font-semibold text-slate-200">{symbol} 7D Hourly Movement</h2>
+        <span className="text-[11px] text-slate-500">최근 7일 · 1시간봉</span>
+      </div>
+
+      {candles.length === 0 ? (
+        <p className="text-xs text-slate-500">No hourly data</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+              <p className="text-[11px] text-slate-500 mb-1">Current Price</p>
+              <p className="text-xl font-black text-white">{formatPrice(currentPrice)}</p>
+              <p className="text-[11px] text-slate-500 mt-1">{latest?.timestamp ? new Date(latest.timestamp).toLocaleString() : "-"}</p>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+              <p className="text-[11px] text-slate-500 mb-1">24H Change</p>
+              <p className={`text-xl font-black ${change24hPct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(change24hPct)}</p>
+              <p className="text-[11px] text-slate-500 mt-1">vs 24 hours ago</p>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+              <p className="text-[11px] text-slate-500 mb-1">7D Range</p>
+              <p className="text-sm font-semibold text-slate-200">
+                {formatPrice(Math.min(...candles.map((x) => x.close)))} ~ {formatPrice(Math.max(...candles.map((x) => x.close)))}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">high / low</p>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-slate-700 overflow-hidden">
+            <div className="max-h-48 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-900/60 text-slate-400 sticky top-0">
+                  <tr>
+                    <th className="text-left px-2 py-1.5 font-medium">Hour</th>
+                    <th className="text-right px-2 py-1.5 font-medium">Price</th>
+                    <th className="text-right px-2 py-1.5 font-medium">Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {last24.map((row, idx) => {
+                    const prev = idx < last24.length - 1 ? last24[idx + 1] : undefined;
+                    const pct = prev && prev.close > 0 ? ((row.close - prev.close) / prev.close) * 100 : 0;
+                    return (
+                      <tr key={`${row.timestamp}-${idx}`} className="border-t border-slate-800">
+                        <td className="px-2 py-1.5 text-slate-300">{new Date(row.timestamp).toLocaleString()}</td>
+                        <td className="px-2 py-1.5 text-right text-slate-200 font-mono">{formatPrice(row.close)}</td>
+                        <td className={`px-2 py-1.5 text-right font-mono ${pct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(pct)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function DailyClose30Panel({ symbol, candles }: { symbol: string; candles: CandleDoc[] }) {
+  const last30 = candles.slice(-30).reverse();
+
+  return (
+    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="font-semibold text-slate-200">{symbol} Daily Close (30D)</h2>
+        <span className="text-[11px] text-slate-500">최근 30일 종가</span>
+      </div>
+
+      {last30.length === 0 ? (
+        <p className="text-xs text-slate-500">No daily close data</p>
+      ) : (
+        <div className="rounded-lg border border-slate-700 overflow-hidden">
+          <div className="max-h-64 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-900/60 text-slate-400 sticky top-0">
+                <tr>
+                  <th className="text-left px-2 py-1.5 font-medium">Date</th>
+                  <th className="text-right px-2 py-1.5 font-medium">Close</th>
+                  <th className="text-right px-2 py-1.5 font-medium">D-1 Change</th>
+                </tr>
+              </thead>
+              <tbody>
+                {last30.map((row, idx) => {
+                  const prev = idx < last30.length - 1 ? last30[idx + 1] : undefined;
+                  const pct = prev && prev.close > 0 ? ((row.close - prev.close) / prev.close) * 100 : 0;
+                  return (
+                    <tr key={`${row.timestamp}-${idx}`} className="border-t border-slate-800">
+                      <td className="px-2 py-1.5 text-slate-300">{new Date(row.timestamp).toLocaleDateString()}</td>
+                      <td className="px-2 py-1.5 text-right text-slate-200 font-mono">{formatPrice(row.close)}</td>
+                      <td className={`px-2 py-1.5 text-right font-mono ${pct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(pct)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main dashboard ─────────────────────────────────────────────────────────
 export default function Dashboard() {
   const [symbol, setSymbol] = useState("NVDA");
   const [inputSymbol, setInputSymbol] = useState("NVDA");
+  const [timingTF, setTimingTF] = useState("120");
+  const [watchlistItems, setWatchlistItems] = useState<WatchlistItem[]>([]);
   const [candles, setCandles] = useState<CandleDoc[]>([]);
+  const [hourlyCandles, setHourlyCandles] = useState<CandleDoc[]>([]);
+  const [daily30Candles, setDaily30Candles] = useState<CandleDoc[]>([]);
   const [signal, setSignal] = useState<Signal | null>(null);
   const [loading, setLoading] = useState(false);
   const [notifying, setNotifying] = useState(false);
@@ -381,12 +714,17 @@ export default function Dashboard() {
     setLoading(true);
     setError("");
     setSignal(null);
+    setHourlyCandles([]);
     try {
-      const [c, s] = await Promise.all([
-        fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&limit=300`),
-        fetchJSON<Signal>(`/api/signal?symbol=${sym}`),
+      const [c, h7, d30, s] = await Promise.all([
+        fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=1d&limit=300`),
+        fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=60&limit=168`),
+        fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=1d&limit=30`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${timingTF}`),
       ]);
       setCandles(c);
+      setHourlyCandles(h7);
+      setDaily30Candles(d30);
       setSignal(s);
       setLastUpdate(new Date().toISOString().slice(11, 19));
     } catch (e) {
@@ -409,7 +747,7 @@ export default function Dashboard() {
     setNotifying(true);
     setNotifyMsg("");
     try {
-      const res = await fetch(`${API_BASE}/api/notify?symbol=${symbol}`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/api/notify?symbol=${symbol}&timing_tf=${timingTF}`, { method: "POST" });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error ?? "unknown error");
       setNotifyMsg(`Sent [${d.symbol}] ${d.action} to Telegram`);
@@ -422,10 +760,25 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData(symbol);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [timingTF]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const watchlistSymbols = watchlistItems.map((item) => item.symbol);
+  const hasCurrentInWatchlist = watchlistSymbols.includes(symbol);
+  const currentPrice = hourlyCandles[hourlyCandles.length - 1]?.close ?? candles[candles.length - 1]?.close;
 
   return (
     <div className="min-h-screen bg-[#0f1117] text-slate-200 p-4 md:p-6">
+      <div className="sticky top-2 z-30 mb-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-indigo-400/40 bg-slate-900/90 backdrop-blur px-3 py-1.5 shadow-lg">
+          <span className="text-[11px] text-slate-400">현재가</span>
+          <span className="text-xs font-mono text-indigo-300">{symbol}</span>
+          <span className="text-sm font-black text-white">
+            {typeof currentPrice === "number" ? formatPrice(currentPrice) : "-"}
+          </span>
+          {lastUpdate && <span className="text-[10px] text-slate-500">{lastUpdate}</span>}
+        </div>
+      </div>
+
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
         <div>
@@ -448,6 +801,27 @@ export default function Dashboard() {
           >
             {loading ? "Loading..." : "Analyze"}
           </button>
+          <select
+            value={timingTF}
+            onChange={(e) => setTimingTF(e.target.value)}
+            className="px-2 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg focus:outline-none focus:border-indigo-500"
+          >
+            <option value="60">Timing 1H</option>
+            <option value="120">Timing 2H</option>
+            <option value="240">Timing 4H</option>
+          </select>
+          {watchlistSymbols.length > 0 && (
+            <select
+              value={symbol}
+              onChange={(e) => handleAnalyze(e.target.value)}
+              className="px-2 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg focus:outline-none focus:border-indigo-500"
+            >
+              {!hasCurrentInWatchlist && <option value={symbol}>{symbol}</option>}
+              {watchlistSymbols.map((sym) => (
+                <option key={sym} value={sym}>{sym}</option>
+              ))}
+            </select>
+          )}
           <button
             onClick={handleNotify}
             disabled={notifying || !signal}
@@ -458,6 +832,24 @@ export default function Dashboard() {
           {lastUpdate && <span className="text-xs text-slate-500">Updated: {lastUpdate}</span>}
         </div>
       </div>
+
+      {watchlistSymbols.length > 0 && (
+        <div className="mb-4 flex flex-wrap gap-2">
+          {watchlistSymbols.map((sym) => (
+            <button
+              key={sym}
+              onClick={() => handleAnalyze(sym)}
+              className={`text-xs px-2.5 py-1 rounded border transition-colors ${
+                sym === symbol
+                  ? "border-indigo-400 bg-indigo-500/20 text-indigo-200"
+                  : "border-slate-600 bg-slate-800 text-slate-300 hover:border-indigo-500"
+              }`}
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      )}
 
       {notifyMsg && (
         <div className={`mb-3 p-2 rounded-lg text-xs text-center ${notifyMsg.startsWith("Error") ? "bg-red-500/20 text-red-300" : "bg-emerald-500/20 text-emerald-300"}`}>
@@ -507,6 +899,9 @@ export default function Dashboard() {
               <p className="text-xs text-slate-500 mt-3 leading-relaxed">{signal.reason}</p>
             </div>
           )}
+
+          <Hourly7DayPanel symbol={symbol} candles={hourlyCandles} />
+          <DailyClose30Panel symbol={symbol} candles={daily30Candles} />
         </div>
 
         {/* Right: Signal + Indicators + Watchlist + DB */}
@@ -516,6 +911,13 @@ export default function Dashboard() {
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-semibold text-slate-200">Overall Signal</h2>
                 <span className={`text-2xl font-black ${actionColor(signal.action)}`}>{signal.action}</span>
+              </div>
+              <div className="flex items-center gap-2 mb-2 text-xs text-slate-300">
+                <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">D: {signal.trend_action ?? signal.action}</span>
+                <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">H: {signal.timing_action ?? signal.action}</span>
+                {signal.is_special_signal && (
+                  <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">Special</span>
+                )}
               </div>
               <ProbBar buy={signal.buy_pct} sell={signal.sell_pct} hold={signal.hold_pct} />
               <p className="text-xs text-slate-500 mt-2">
@@ -557,7 +959,8 @@ export default function Dashboard() {
             </div>
           )}
 
-          <WatchlistPanel onSelect={(sym) => handleAnalyze(sym)} />
+          <WatchlistPanel onSelect={(sym) => handleAnalyze(sym)} onItemsChange={setWatchlistItems} />
+          <SourceStatusPanel />
           <DBStatsPanel />
         </div>
       </div>
