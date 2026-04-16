@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gunh0/midas-touch/internal/advisor"
 	"github.com/gunh0/midas-touch/internal/api"
 	"github.com/gunh0/midas-touch/internal/marketdata"
@@ -33,6 +34,8 @@ const (
 )
 
 func main() {
+	gin.SetMode(gin.ReleaseMode)
+
 	cleanupLogger := setupLogger()
 	defer cleanupLogger()
 

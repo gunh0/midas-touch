@@ -187,7 +187,12 @@ func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyInterv
 	}
 	filter := bson.D{{Key: "symbol", Value: symbol}}
 	update := bson.D{
-		{Key: "$setOnInsert", Value: WatchlistItem{Symbol: symbol, AddedAt: time.Now(), Pinned: false, SortOrder: order}},
+		{Key: "$setOnInsert", Value: bson.D{
+			{Key: "symbol", Value: symbol},
+			{Key: "added_at", Value: time.Now()},
+			{Key: "pinned", Value: false},
+			{Key: "sort_order", Value: order},
+		}},
 		{Key: "$set", Value: bson.D{{Key: "notify_interval_hour", Value: notifyIntervalHour}}},
 	}
 	opts := options.UpdateOne().SetUpsert(true)

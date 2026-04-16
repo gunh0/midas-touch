@@ -40,6 +40,7 @@ func NewHandler(db *mongodb.Client, mc *marketdata.Client) *Handler {
 
 func NewRouter(h *Handler) *gin.Engine {
 	r := gin.New()
+	_ = r.SetTrustedProxies(nil)
 	r.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
 
 	r.GET("/swagger.json", h.swaggerDoc)
