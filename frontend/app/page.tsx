@@ -89,6 +89,9 @@ interface SourceStatus {
 interface ScanRow {
   symbol: string;
   signal: Signal;
+  companyName?: string;
+  exchange?: string;
+  typeLabel?: string;
 }
 
 const MARKET_CAP_BASE_SYMBOLS = [
@@ -99,6 +102,7 @@ const MARKET_CAP_BASE_SYMBOLS = [
 const SCAN_TF = "120";
 const CUSTOM_UNIVERSE_STORAGE_KEY = "midas.custom.universe.symbols";
 const EXCLUDED_UNIVERSE_STORAGE_KEY = "midas.excluded.universe.symbols";
+const DASHBOARD_PREFS_STORAGE_KEY = "midas.dashboard.preferences";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 async function fetchJSON<T>(path: string): Promise<T> {
@@ -130,6 +134,31 @@ function formatPct(v: number) {
 
 function notifyModeLabel(mode?: string) {
   return mode === "interval" ? "Interval" : "Event";
+}
+
+function inferCountryFromExchange(exchange?: string) {
+  const ex = (exchange ?? "").toUpperCase();
+  if (ex.includes("NASDAQ") || ex.includes("NYSE") || ex.includes("AMEX") || ex === "NMS") return "US";
+  if (ex.includes("KOSPI") || ex.includes("KOSDAQ") || ex.includes("KRX")) return "KR";
+  if (ex.includes("TSE") || ex.includes("JPX")) return "JP";
+  if (ex.includes("LSE")) return "UK";
+  if (ex.includes("HKEX")) return "HK";
+  if (ex.includes("SSE") || ex.includes("SZSE")) return "CN";
+  return "-";
+}
+
+function normalizeTypeLabel(typeDisplay?: string) {
+  const t = (typeDisplay ?? "").toUpperCase();
+  if (t.includes("ETF")) return "ETF";
+  if (t.includes("EQUITY") || t.includes("COMMON") || t.includes("STOCK")) return "Stock";
+  if (!t) return "-";
+  return typeDisplay ?? "-";
+}
+
+function typeBadgeClass(typeLabel: string) {
+  if (typeLabel === "ETF") return "border-cyan-500/40 text-cyan-300 bg-cyan-500/10";
+  if (typeLabel === "Stock") return "border-emerald-500/40 text-emerald-300 bg-emerald-500/10";
+  return "border-slate-600 text-slate-300 bg-slate-700/40";
 }
 
 function actionEmoji(action: string) {
@@ -398,7 +427,7 @@ function WatchlistPanel({
   return (
     <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
       <h3 className="text-sm font-semibold text-slate-300 mb-1">Watchlist</h3>
-      <p className="text-[11px] text-slate-500 mb-3">E: 상황 변화 시 알림 · I: 주기 강제 알림</p>
+      <p className="text-[11px] text-slate-500 mb-3">E: Event-triggered alerts · I: Interval alerts</p>
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <input
           type="text"
@@ -460,7 +489,15 @@ function WatchlistPanel({
                 <span className="text-xs font-mono text-indigo-300">{row.symbol}</span>
                 <span className="text-[10px] text-slate-500">{row.exchange}</span>
               </div>
-              <p className="text-[11px] text-slate-400 truncate">{row.name || row.type_display}</p>
+              <p className="text-[11px] text-slate-400 truncate">{row.name || "(no name)"}</p>
+              <div className="mt-1 flex items-center gap-1.5">
+                <span className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
+                  Country {inferCountryFromExchange(row.exchange)}
+                </span>
+                <span className={`text-[10px] px-1.5 py-0.5 rounded border ${typeBadgeClass(normalizeTypeLabel(row.type_display))}`}>
+                  {normalizeTypeLabel(row.type_display)}
+                </span>
+              </div>
             </button>
           ))}
         </div>
@@ -504,7 +541,7 @@ function WatchlistPanel({
                     className={`px-1.5 py-0.5 text-[10px] transition-colors ${
                       (item.notify_mode ?? "event") === "event" ? "bg-cyan-500/20 text-cyan-200" : "bg-slate-700 text-slate-400"
                     }`}
-                    title="상황 변화시에만 알림"
+                    title="Alert only on meaningful changes"
                   >
                     E
                   </button>
@@ -513,7 +550,7 @@ function WatchlistPanel({
                     className={`px-1.5 py-0.5 text-[10px] transition-colors border-l border-slate-600 ${
                       item.notify_mode === "interval" ? "bg-amber-500/20 text-amber-200" : "bg-slate-700 text-slate-400"
                     }`}
-                    title="주기 강제 알림"
+                    title="Force alert on interval"
                   >
                     I
                   </button>
@@ -682,7 +719,7 @@ function Hourly7DayPanel({ symbol, candles }: { symbol: string; candles: CandleD
     <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
         <h2 className="font-semibold text-slate-200">{symbol} 7D Hourly Movement</h2>
-        <span className="text-[11px] text-slate-500">최근 7일 · 1시간봉</span>
+        <span className="text-[11px] text-slate-500">Last 7 days · 1H candles</span>
       </div>
 
       {candles.length === 0 ? (
@@ -748,7 +785,7 @@ function DailyClose30Panel({ symbol, candles }: { symbol: string; candles: Candl
     <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
         <h2 className="font-semibold text-slate-200">{symbol} Daily Close (30D)</h2>
-        <span className="text-[11px] text-slate-500">최근 30일 종가</span>
+        <span className="text-[11px] text-slate-500">Last 30 daily closes</span>
       </div>
 
       {last30.length === 0 ? (
@@ -802,6 +839,8 @@ export default function Dashboard() {
   const [lastUpdate, setLastUpdate] = useState("");
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const [autoRefreshSec, setAutoRefreshSec] = useState(30);
+  const [prefsReady, setPrefsReady] = useState(false);
+  const [defaultSymbolSeeded, setDefaultSymbolSeeded] = useState(false);
 
   const [scanRows, setScanRows] = useState<ScanRow[]>([]);
   const [scanLoading, setScanLoading] = useState(false);
@@ -814,6 +853,8 @@ export default function Dashboard() {
   const [customUniverseSymbols, setCustomUniverseSymbols] = useState<string[]>([]);
   const [excludedUniverseSymbols, setExcludedUniverseSymbols] = useState<string[]>([]);
   const [listInputSymbol, setListInputSymbol] = useState("");
+  const [listSearchResults, setListSearchResults] = useState<SymbolSearchResult[]>([]);
+  const [listSearching, setListSearching] = useState(false);
 
   const loadWatchlist = async () => {
     try {
@@ -857,9 +898,14 @@ export default function Dashboard() {
     const target = (sym ?? inputSymbol).trim().toUpperCase();
     if (!target) return;
     setInputSymbol(target);
-    setSymbol(target);
     setNotifyMsg("");
-    loadData(target);
+
+    if (target === symbol) {
+      loadData(target);
+      return;
+    }
+
+    setSymbol(target);
   };
 
   const handleNotify = async () => {
@@ -892,8 +938,20 @@ export default function Dashboard() {
       const symbols = buildManagedSymbols();
       const settled = await Promise.allSettled(
         symbols.map(async (sym) => {
-          const data = await fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${SCAN_TF}`);
-          return { symbol: sym, signal: data };
+          const [data, searchRows] = await Promise.all([
+            fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${SCAN_TF}`),
+            fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(sym)}&limit=5`).catch(() => [] as SymbolSearchResult[]),
+          ]);
+          const exact = (searchRows ?? []).find((x) => x.symbol.toUpperCase() === sym);
+          const fallback = (searchRows ?? [])[0];
+          const picked = exact ?? fallback;
+          return {
+            symbol: sym,
+            signal: data,
+            companyName: picked?.name || "",
+            exchange: picked?.exchange || "",
+            typeLabel: normalizeTypeLabel(picked?.type_display),
+          };
         }),
       );
 
@@ -903,7 +961,7 @@ export default function Dashboard() {
         .sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
 
       setScanRows(rows);
-      setScanUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour12: false }));
+      setScanUpdatedAt(new Date().toLocaleTimeString("en-US", { hour12: false }));
     } catch (e) {
       setScanRows([]);
       setScanError(String(e));
@@ -926,7 +984,7 @@ export default function Dashboard() {
       await loadWatchlist();
       return true;
     } catch (e) {
-      setBatchMsg(`등록 실패: ${String(e)}`);
+      setBatchMsg(`Failed to add alert target: ${String(e)}`);
       return false;
     } finally {
       setScanActionBusy(null);
@@ -943,7 +1001,7 @@ export default function Dashboard() {
       }
       await loadWatchlist();
     } catch (e) {
-      setBatchMsg(`해제 실패: ${String(e)}`);
+      setBatchMsg(`Failed to remove alert target: ${String(e)}`);
     } finally {
       setScanActionBusy(null);
     }
@@ -957,51 +1015,97 @@ export default function Dashboard() {
       const success = await addAlertTarget(row.symbol, mode);
       if (success) ok += 1;
     }
-    setBatchMsg(`알림 대상 일괄 등록 완료: ${ok}/${scanRows.length} (${mode.toUpperCase()})`);
+    setBatchMsg(`Bulk add complete: ${ok}/${scanRows.length} (${mode.toUpperCase()})`);
     setBatchAnalyzing(false);
   };
 
   const analyzeAllAlertTargets = async () => {
     const targets = watchlistItems.map((x) => x.symbol);
     if (targets.length === 0) {
-      setBatchMsg("분석할 알림 대상이 없습니다.");
+      setBatchMsg("No alert targets to analyze.");
       return;
     }
     setBatchAnalyzing(true);
-    setBatchMsg("알림 대상 순차 분석 중...");
+    setBatchMsg("Analyzing alert targets sequentially...");
 
     let buyCount = 0;
     let sellCount = 0;
     let holdCount = 0;
+    let sentCount = 0;
     for (const sym of targets) {
       try {
         const s = await fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${SCAN_TF}`);
         if (s.action === "BUY") buyCount += 1;
         else if (s.action === "SELL") sellCount += 1;
         else holdCount += 1;
+
+        const actionable = s.action !== "HOLD";
+        const confidence = Math.max(s.buy_pct, s.sell_pct);
+        const shouldSend = actionable && (s.is_special_signal || confidence >= 60);
+        if (shouldSend) {
+          const notifyRes = await fetch(`${API_BASE}/api/notify?symbol=${sym}&timing_tf=${SCAN_TF}`, { method: "POST" });
+          if (notifyRes.ok) {
+            sentCount += 1;
+          }
+        }
       } catch {
         // keep going
       }
     }
-    setBatchMsg(`순차 분석 완료: BUY ${buyCount} / HOLD ${holdCount} / SELL ${sellCount}`);
+    setBatchMsg(`Sequential analysis complete: BUY ${buyCount} / HOLD ${holdCount} / SELL ${sellCount} | Sent ${sentCount}`);
     setBatchAnalyzing(false);
     await loadUniverseScan();
   };
 
-  const addUniverseSymbol = () => {
-    const sym = listInputSymbol.trim().toUpperCase();
-    if (!sym) return;
+  const commitUniverseSymbol = (sym: string) => {
+    const normalized = sym.trim().toUpperCase();
+    if (!normalized) return;
 
-    const nextCustom = customUniverseSymbols.includes(sym) || MARKET_CAP_BASE_SYMBOLS.includes(sym)
+    const nextCustom = customUniverseSymbols.includes(normalized) || MARKET_CAP_BASE_SYMBOLS.includes(normalized)
       ? customUniverseSymbols
-      : [...customUniverseSymbols, sym];
+      : [...customUniverseSymbols, normalized];
     setCustomUniverseSymbols(nextCustom);
     localStorage.setItem(CUSTOM_UNIVERSE_STORAGE_KEY, JSON.stringify(nextCustom));
 
-    const nextExcluded = excludedUniverseSymbols.filter((x) => x !== sym);
+    const nextExcluded = excludedUniverseSymbols.filter((x) => x !== normalized);
     setExcludedUniverseSymbols(nextExcluded);
     localStorage.setItem(EXCLUDED_UNIVERSE_STORAGE_KEY, JSON.stringify(nextExcluded));
-    setListInputSymbol("");
+  };
+
+  const addUniverseSymbol = async () => {
+    const query = listInputSymbol.trim();
+    const sym = query.toUpperCase();
+    if (!sym) return;
+
+    try {
+      setListSearching(true);
+      const results = await fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(query)}&limit=8`);
+      setListSearchResults(results ?? []);
+
+      const exact = (results ?? []).find((r) => r.symbol.toUpperCase() === sym);
+      if (exact) {
+        commitUniverseSymbol(exact.symbol);
+        setBatchMsg(`Added: ${exact.symbol} (${exact.name || exact.type_display || ""})`);
+        setListInputSymbol("");
+        setListSearchResults([]);
+        return;
+      }
+
+      if ((results ?? []).length > 0) {
+        const first = results[0];
+        commitUniverseSymbol(first.symbol);
+        setBatchMsg(`Added ${first.symbol} (${first.name || first.type_display || ""}) from results for '${query}'.`);
+        setListInputSymbol("");
+        setListSearchResults([]);
+        return;
+      }
+
+      setBatchMsg(`No results found for '${query}', nothing added.`);
+    } catch (e) {
+      setBatchMsg(`Symbol validation failed: ${String(e)}`);
+    } finally {
+      setListSearching(false);
+    }
   };
 
   const removeUniverseSymbol = async (sym: string) => {
@@ -1021,23 +1125,65 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    loadData(symbol);
-  }, [timingTF]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!autoRefreshEnabled) {
+    if (!prefsReady) {
       return;
     }
+    loadData(symbol);
+  }, [prefsReady, symbol, timingTF]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!prefsReady || !autoRefreshEnabled) {
+      return;
+    }
+
     const t = setInterval(() => {
       loadData(symbol, { silent: true });
     }, autoRefreshSec * 1000);
     return () => clearInterval(t);
-  }, [symbol, timingTF, autoRefreshEnabled, autoRefreshSec]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, timingTF, autoRefreshEnabled, autoRefreshSec, prefsReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!prefsReady) {
+      return;
+    }
+
+    localStorage.setItem(
+      DASHBOARD_PREFS_STORAGE_KEY,
+      JSON.stringify({
+        symbol,
+        timingTF,
+        autoRefreshEnabled,
+        autoRefreshSec,
+      }),
+    );
+  }, [prefsReady, symbol, timingTF, autoRefreshEnabled, autoRefreshSec]);
+
+  useEffect(() => {
+    if (!prefsReady || defaultSymbolSeeded) {
+      return;
+    }
+
+    const rawDashboardPrefs = localStorage.getItem(DASHBOARD_PREFS_STORAGE_KEY);
+    if (rawDashboardPrefs) {
+      setDefaultSymbolSeeded(true);
+      return;
+    }
+
+    if (watchlistItems.length > 0) {
+      const first = String(watchlistItems[0].symbol ?? "").trim().toUpperCase();
+      if (first) {
+        setSymbol(first);
+        setInputSymbol(first);
+      }
+      setDefaultSymbolSeeded(true);
+    }
+  }, [prefsReady, defaultSymbolSeeded, watchlistItems]);
 
   useEffect(() => {
     loadWatchlist();
     const rawCustom = localStorage.getItem(CUSTOM_UNIVERSE_STORAGE_KEY);
     const rawExcluded = localStorage.getItem(EXCLUDED_UNIVERSE_STORAGE_KEY);
+    const rawDashboardPrefs = localStorage.getItem(DASHBOARD_PREFS_STORAGE_KEY);
     try {
       if (rawCustom) {
         const parsed = JSON.parse(rawCustom);
@@ -1047,8 +1193,37 @@ export default function Dashboard() {
         const parsed = JSON.parse(rawExcluded);
         if (Array.isArray(parsed)) setExcludedUniverseSymbols(parsed.map((x) => String(x).toUpperCase()));
       }
+
+      if (rawDashboardPrefs) {
+        const parsed = JSON.parse(rawDashboardPrefs) as {
+          symbol?: string;
+          timingTF?: string;
+          autoRefreshEnabled?: boolean;
+          autoRefreshSec?: number;
+        };
+
+        const savedSymbol = String(parsed.symbol ?? "").trim().toUpperCase();
+        if (savedSymbol) {
+          setSymbol(savedSymbol);
+          setInputSymbol(savedSymbol);
+        }
+
+        if (parsed.timingTF && ["60", "120", "240"].includes(parsed.timingTF)) {
+          setTimingTF(parsed.timingTF);
+        }
+
+        if (typeof parsed.autoRefreshEnabled === "boolean") {
+          setAutoRefreshEnabled(parsed.autoRefreshEnabled);
+        }
+
+        if ([10, 30, 60].includes(Number(parsed.autoRefreshSec))) {
+          setAutoRefreshSec(Number(parsed.autoRefreshSec));
+        }
+      }
     } catch {
       // ignore invalid storage
+    } finally {
+      setPrefsReady(true);
     }
   }, []);
 
@@ -1057,6 +1232,28 @@ export default function Dashboard() {
     const t = setInterval(loadUniverseScan, 180_000);
     return () => clearInterval(t);
   }, [watchlistItems, customUniverseSymbols, excludedUniverseSymbols]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const q = listInputSymbol.trim();
+    if (q.length < 2) {
+      setListSearchResults([]);
+      return;
+    }
+
+    const t = setTimeout(async () => {
+      try {
+        setListSearching(true);
+        const rows = await fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(q)}&limit=8`);
+        setListSearchResults(rows ?? []);
+      } catch {
+        setListSearchResults([]);
+      } finally {
+        setListSearching(false);
+      }
+    }, 250);
+
+    return () => clearTimeout(t);
+  }, [listInputSymbol]);
 
   const watchlistSymbols = watchlistItems.map((item) => item.symbol);
   const hasCurrentInWatchlist = watchlistSymbols.includes(symbol);
@@ -1069,7 +1266,7 @@ export default function Dashboard() {
           <div>
             <p className="text-[11px] tracking-[0.2em] uppercase text-cyan-300/80">Midas Touch Control Room</p>
             <h2 className="text-xl md:text-2xl font-bold text-white mt-1">Market Cap Priority List</h2>
-            <p className="text-xs md:text-sm text-slate-400 mt-1">시총 우선 기본 리스트 + 사용자 추가/삭제 | Timing: {SCAN_TF}m</p>
+            <p className="text-xs md:text-sm text-slate-400 mt-1">Market-cap seeded list + user add/remove | Timing: {SCAN_TF}m</p>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-[11px] text-slate-400">Updated</span>
@@ -1077,18 +1274,53 @@ export default function Dashboard() {
             <input
               type="text"
               value={listInputSymbol}
-              onChange={(e) => setListInputSymbol(e.target.value.toUpperCase())}
+              onChange={(e) => setListInputSymbol(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addUniverseSymbol()}
-              placeholder="Add symbol"
+              placeholder="Search symbol/company (e.g. NVDA, NVIDIA)"
               className="w-28 text-xs px-2 py-1.5 rounded border border-slate-600 bg-slate-900/70 text-slate-200"
             />
-            <button onClick={addUniverseSymbol} className="text-xs px-3 py-1.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 transition-colors">리스트 추가</button>
+            <button onClick={addUniverseSymbol} disabled={listSearching} className="text-xs px-3 py-1.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 transition-colors disabled:opacity-60">{listSearching ? "Validating..." : "Add to List"}</button>
             <button onClick={loadUniverseScan} disabled={scanLoading} className="text-xs px-3 py-1.5 rounded border border-cyan-400/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20 transition-colors disabled:opacity-60">{scanLoading ? "Scanning..." : "Rescan"}</button>
-            <button onClick={() => registerAllVisible("event")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 transition-colors disabled:opacity-60">일괄등록 E</button>
-            <button onClick={() => registerAllVisible("interval")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 transition-colors disabled:opacity-60">일괄등록 I</button>
-            <button onClick={analyzeAllAlertTargets} disabled={batchAnalyzing || watchlistItems.length === 0} className="text-xs px-3 py-1.5 rounded border border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-colors disabled:opacity-60">{batchAnalyzing ? "분석중..." : "알림대상 전체 분석"}</button>
+            <button onClick={() => registerAllVisible("event")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 transition-colors disabled:opacity-60">Bulk Add E</button>
+            <button onClick={() => registerAllVisible("interval")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 transition-colors disabled:opacity-60">Bulk Add I</button>
+            <button onClick={analyzeAllAlertTargets} disabled={batchAnalyzing || watchlistItems.length === 0} className="text-xs px-3 py-1.5 rounded border border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-colors disabled:opacity-60">{batchAnalyzing ? "Analyzing..." : "Analyze All Alert Targets"}</button>
           </div>
         </div>
+        {(listSearching || listSearchResults.length > 0) && (
+          <div className="mb-3 rounded-lg border border-slate-700 bg-slate-900/70 p-2">
+            {listSearching && <p className="text-[11px] text-slate-500 px-1 py-1">Searching symbols...</p>}
+            {listSearchResults.length > 0 && (
+              <div className="max-h-36 overflow-auto">
+                {listSearchResults.map((row) => (
+                  <button
+                    key={`${row.symbol}-${row.exchange}`}
+                    onClick={() => {
+                      commitUniverseSymbol(row.symbol);
+                      setBatchMsg(`Added: ${row.symbol} (${row.name || row.type_display || ""})`);
+                      setListInputSymbol("");
+                      setListSearchResults([]);
+                    }}
+                    className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-cyan-200">{row.symbol}</span>
+                      <span className="text-[10px] text-slate-500">{row.exchange}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 truncate">{row.name || "(no name)"}</p>
+                    <div className="mt-1 flex items-center gap-1.5">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
+                        Country {inferCountryFromExchange(row.exchange)}
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${typeBadgeClass(normalizeTypeLabel(row.type_display))}`}>
+                        {normalizeTypeLabel(row.type_display)}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {batchMsg && <div className="mb-3 rounded border border-slate-700 bg-slate-900/50 px-3 py-2 text-xs text-slate-300">{batchMsg}</div>}
 
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
@@ -1134,7 +1366,10 @@ export default function Dashboard() {
                     const busy = scanActionBusy?.startsWith(`${row.symbol}:`);
                     return (
                       <tr key={row.symbol} className="border-t border-slate-800 hover:bg-cyan-500/5 transition-colors cursor-pointer" onClick={() => handleAnalyze(row.symbol)}>
-                        <td className="px-3 py-2 font-mono text-white">{actionEmoji(row.signal.action)} {row.symbol}</td>
+                        <td className="px-3 py-2">
+                          <div className="font-mono text-white">{actionEmoji(row.signal.action)} {row.symbol}</div>
+                          <div className="mt-0.5 text-[10px] text-slate-400 truncate max-w-[220px]">{row.companyName || "No company name"}</div>
+                        </td>
                         <td className={`px-3 py-2 text-right font-mono ${scanScoreClass(row.signal.buy_pct)}`}>{row.signal.buy_pct.toFixed(0)}%</td>
                         <td className="px-3 py-2 text-right font-mono text-slate-400">{row.signal.hold_pct.toFixed(0)}%</td>
                         <td className="px-3 py-2 text-right font-mono text-slate-400">{row.signal.sell_pct.toFixed(0)}%</td>
@@ -1149,19 +1384,19 @@ export default function Dashboard() {
                                 <button onClick={() => addAlertTarget(row.symbol, "interval")} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50">I+</button>
                               </>
                             )}
-                            {isOn && <button onClick={() => removeAlertTarget(row.symbol)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-red-500/40 text-red-200 hover:bg-red-500/20 disabled:opacity-50">해제</button>}
+                            {isOn && <button onClick={() => removeAlertTarget(row.symbol)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-red-500/40 text-red-200 hover:bg-red-500/20 disabled:opacity-50">Remove</button>}
                           </div>
                         </td>
                         <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                          <button onClick={() => removeUniverseSymbol(row.symbol)} className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 hover:border-red-400 hover:text-red-300">삭제</button>
+                          <button onClick={() => removeUniverseSymbol(row.symbol)} className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 hover:border-red-400 hover:text-red-300">Delete</button>
                         </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
-              {!scanLoading && scanRows.length === 0 && <div className="p-6 text-center text-slate-500 text-xs">리스트에 표시할 종목이 없습니다.</div>}
-              {scanLoading && <div className="p-6 text-center text-cyan-300 text-xs">스캔 중...</div>}
+              {!scanLoading && scanRows.length === 0 && <div className="p-6 text-center text-slate-500 text-xs">No symbols available in this list.</div>}
+              {scanLoading && <div className="p-6 text-center text-cyan-300 text-xs">Scanning...</div>}
               {scanError && <div className="p-4 text-center text-red-300 text-xs">{scanError}</div>}
             </div>
           </div>
@@ -1170,7 +1405,7 @@ export default function Dashboard() {
 
       <div className="sticky top-2 z-30 mb-3">
         <div className="inline-flex items-center gap-2 rounded-full border border-indigo-400/40 bg-slate-900/90 backdrop-blur px-3 py-1.5 shadow-lg">
-          <span className="text-[11px] text-slate-400">현재가</span>
+          <span className="text-[11px] text-slate-400">Price</span>
           <span className="text-xs font-mono text-indigo-300">{symbol}</span>
           <span className="text-sm font-black text-white">{typeof currentPrice === "number" ? formatPrice(currentPrice) : "-"}</span>
           {lastUpdate && <span className="text-[10px] text-slate-500">{lastUpdate}</span>}

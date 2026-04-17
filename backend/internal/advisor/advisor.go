@@ -349,11 +349,17 @@ func FormatMessage(r Recommendation) string {
 		weeklyAction = r.TrendAction
 	}
 	entry, stop, target1, target2 := buildTradePlan(r, currentPrice)
+	entryLine := fmt.Sprintf("- Entry(진입가): $%.2f", entry)
 	stopLabel := "Stop Loss(손절가)"
+	target1Label := "Target 1(목표가1)"
+	target2Label := "Target 2(목표가2)"
 	planNote := ""
 	if strings.EqualFold(r.Action, "SELL") {
-		stopLabel = "Stop Loss(손절가, 숏 기준)"
-		planNote = "- Note(참고): SELL 시나리오는 숏(하락) 기준이라 손절가가 진입가보다 위에 위치할 수 있습니다.\n"
+		entryLine = "- Entry(신규매수): 보류"
+		stopLabel = "보유자 방어선(이탈 시 비중축소)"
+		target1Label = "재진입 관심가 1"
+		target2Label = "재진입 관심가 2"
+		planNote = "- Note(참고): 일반 투자자(롱 전용) 기준으로 SELL은 신규 숏 진입이 아니라 보수적 대응 신호입니다.\n"
 	}
 
 	return fmt.Sprintf(
@@ -368,10 +374,10 @@ func FormatMessage(r Recommendation) string {
 			"- %s Bias(진입): %s %s\n"+
 			"- 7D Bias(스윙): %s %s (7D %+.2f%%)\n"+
 			"%s"+
-			"- Entry(진입가): $%.2f\n"+
+			"%s\n"+
 			"- %s: $%.2f\n"+
-			"- Target 1(목표가1): $%.2f\n"+
-			"- Target 2(목표가2): $%.2f\n\n"+
+			"- %s: $%.2f\n"+
+			"- %s: $%.2f\n\n"+
 			"Indicators(지표)\n"+
 			"- RSI14: %.1f\n"+
 			"- SMA20: %.2f | SMA50: %.2f\n"+
@@ -391,7 +397,7 @@ func FormatMessage(r Recommendation) string {
 		intradayLabel, actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),
 		actionSignalEmoji(weeklyAction), actionWithKorean(weeklyAction), r.WeeklyChange,
 		planNote,
-		entry, stopLabel, stop, target1, target2,
+		entryLine, stopLabel, stop, target1Label, target1, target2Label, target2,
 		r.Indicators.RSI14,
 		r.Indicators.SMA20, r.Indicators.SMA50,
 		r.Indicators.BBUpper, r.Indicators.BBMid, r.Indicators.BBLower,

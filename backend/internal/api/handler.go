@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -300,7 +301,9 @@ func (h *Handler) notify(c *gin.Context) {
 		return
 	}
 
-	if err := h.tgClient.SendMessage(advisor.FormatMessage(reco)); err != nil {
+	manualHeader := fmt.Sprintf("✅ 웹 전송 시그널 [MANUAL] symbol=%s timing=%s", reco.TargetSymbol, strings.ToUpper(timingTF))
+	msg := manualHeader + "\n\n" + advisor.FormatMessage(reco)
+	if err := h.tgClient.SendMessage(msg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "telegram: " + err.Error()})
 		return
 	}

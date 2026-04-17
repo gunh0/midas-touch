@@ -10,6 +10,7 @@ llm.md
 
 # Go
 backend/vendor/
+backend/tmp/
 
 # Node / Next.js
 frontend/node_modules/

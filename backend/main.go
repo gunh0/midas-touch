@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -210,11 +211,7 @@ func main() {
 			}
 
 			msg := advisor.FormatMessage(reco)
-			if specialDue {
-				msg = fmt.Sprintf("[SPECIAL SIGNAL][%s] %s\n\n%s", strings.ToUpper(notifyMode), why, msg)
-			} else {
-				msg = fmt.Sprintf("[%s] %s\n\n%s", strings.ToUpper(notifyMode), why, msg)
-			}
+			msg = formatSignalHeader(notifyMode, specialDue, why) + "\n\n" + msg
 
 			if err := tgClient.SendMessage(msg); err != nil {
 				log.Printf("telegram send %s: %v", item.Symbol, err)
@@ -229,7 +226,12 @@ func main() {
 		}
 
 		if lastPopularScanAt.IsZero() || now.Sub(lastPopularScanAt) >= time.Duration(popularScanInterval)*time.Hour {
-			symbols := advisor.PopularLeaderSymbols()
+			symbols := watchlistSymbols(items)
+			if len(symbols) == 0 {
+				log.Printf("watchlist scan: skipped (no watchlist symbols)")
+				lastPopularScanAt = now
+				return
+			}
 			candidates := make([]advisor.Recommendation, 0, len(symbols))
 
 			for _, symbol := range symbols {
@@ -246,14 +248,14 @@ func main() {
 			}
 
 			if len(candidates) > 0 {
-				msg := formatPopularBuyDigest(candidates, popularBuyMinPct)
+				msg := formatPopularBuyDigest(candidates, popularBuyMinPct, popularScanInterval)
 				if err := tgClient.SendMessage(msg); err != nil {
 					log.Printf("popular scan telegram send: %v", err)
 				} else {
-					log.Printf("popular scan notified: %d candidates", len(candidates))
+					log.Printf("watchlist scan notified: %d candidates (symbols=%d)", len(candidates), len(symbols))
 				}
 			} else {
-				log.Printf("popular scan: no BUY candidates (min_buy_pct=%.0f)", popularBuyMinPct)
+				log.Printf("watchlist scan: no BUY candidates (min_buy_pct=%.0f, symbols=%d)", popularBuyMinPct, len(symbols))
 			}
 
 			lastPopularScanAt = now
@@ -336,16 +338,31 @@ func isBuyCandidate(reco advisor.Recommendation, minBuyPct float64) bool {
 	return true
 }
 
-func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float64) string {
-	b := strings.Builder{}
-	b.WriteString("Popular Leaders Scan (인기 대장주 스캔)\n")
-	b.WriteString(fmt.Sprintf("조건: BUY && Buy>=%.0f%%\n", minBuyPct))
-	b.WriteString(fmt.Sprintf("시간: %s\n\n", time.Now().Format("2006-01-02 15:04 KST")))
+func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float64, scanIntervalHours int) string {
+	highlights := selectPopularHighlights(candidates)
 
-	for _, reco := range candidates {
+	b := strings.Builder{}
+	b.WriteString("Watchlist Leaders Scan (DB 기반 알림 대상 스캔, 하이라이트)\n")
+	b.WriteString(fmt.Sprintf("조건: BUY && Buy>=%.0f%%\n", minBuyPct))
+	b.WriteString(fmt.Sprintf("시간: %s\n", time.Now().Format("2006-01-02 15:04 KST")))
+	b.WriteString(fmt.Sprintf("발송 주기: %d시간마다 스캔 시\n", scanIntervalHours))
+	b.WriteString("발송 조건: 후보가 1개 이상일 때만 전송\n")
+	b.WriteString(fmt.Sprintf("전체 후보 %d개 중 상위 %d개만 전송\n", len(candidates), len(highlights)))
+	if len(candidates) > len(highlights) {
+		b.WriteString("- 신호가 유사한 종목은 생략하고 상위 신뢰도만 표시합니다.\n")
+	}
+	b.WriteString("\n")
+
+	for _, reco := range highlights {
+		name := popularSymbolName(reco.TargetSymbol)
+		heading := reco.TargetSymbol
+		if name != "" {
+			heading = fmt.Sprintf("%s | %s", reco.TargetSymbol, name)
+		}
+
 		b.WriteString(fmt.Sprintf(
-			"[%s] %s %s\n- Buy %.0f%% | Hold %.0f%% | Sell %.0f%%\n- Direction: %s %s | Timing: %s %s\n\n",
-			reco.TargetSymbol,
+			"[%s] %s %s\n- Buy %.0f%% | Hold %.0f%% | Sell %.0f%%\n- Direction: %s %s | Timing: %s %s\n- Conviction: %.0f\n\n",
+			heading,
 			actionSignalEmoji(reco.Action),
 			actionWithKorean(reco.Action),
 			reco.BuyPercent,
@@ -355,10 +372,81 @@ func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float
 			actionWithKorean(reco.TrendAction),
 			actionSignalEmoji(reco.TimingAction),
 			actionWithKorean(reco.TimingAction),
+			reco.BuyPercent-(reco.SellPercent*0.5),
 		))
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+func popularSymbolName(symbol string) string {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "TQQQ":
+		return "ProShares UltraPro QQQ"
+	case "QQQ":
+		return "Invesco QQQ Trust"
+	case "SPY":
+		return "SPDR S&P 500 ETF Trust"
+	case "SOXL":
+		return "Direxion Daily Semiconductor Bull 3X"
+	case "SOXX":
+		return "iShares Semiconductor ETF"
+	case "NVDA":
+		return "NVIDIA"
+	case "TSLA":
+		return "Tesla"
+	case "AAPL":
+		return "Apple"
+	case "MSFT":
+		return "Microsoft"
+	case "AMZN":
+		return "Amazon"
+	case "META":
+		return "Meta Platforms"
+	case "GOOGL":
+		return "Alphabet Class A"
+	case "AMD":
+		return "Advanced Micro Devices"
+	case "PLTR":
+		return "Palantir Technologies"
+	case "SMCI":
+		return "Super Micro Computer"
+	default:
+		return ""
+	}
+}
+
+func selectPopularHighlights(candidates []advisor.Recommendation) []advisor.Recommendation {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	sorted := make([]advisor.Recommendation, len(candidates))
+	copy(sorted, candidates)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].BuyPercent == sorted[j].BuyPercent {
+			return sorted[i].TargetSymbol < sorted[j].TargetSymbol
+		}
+		return sorted[i].BuyPercent > sorted[j].BuyPercent
+	})
+
+	strong := make([]advisor.Recommendation, 0, len(sorted))
+	for _, reco := range sorted {
+		if reco.BuyPercent >= 70 && reco.TrendAction == "BUY" && reco.TimingAction == "BUY" {
+			strong = append(strong, reco)
+		}
+	}
+
+	selected := strong
+	if len(selected) == 0 {
+		selected = sorted
+	}
+
+	const maxItems = 5
+	if len(selected) > maxItems {
+		selected = selected[:maxItems]
+	}
+	return selected
 }
 
 func actionWithKorean(action string) string {
@@ -385,6 +473,20 @@ func actionSignalEmoji(action string) string {
 	default:
 		return "⚪"
 	}
+}
+
+func formatSignalHeader(notifyMode string, specialDue bool, reason string) string {
+	mode := strings.ToLower(strings.TrimSpace(notifyMode))
+
+	if specialDue {
+		return fmt.Sprintf("🚨 강제 시그널 [FORCED] %s", reason)
+	}
+
+	if mode == "interval" {
+		return fmt.Sprintf("⏰ 인터벌 시그널 [INTERVAL] %s", reason)
+	}
+
+	return fmt.Sprintf("🚨 이벤트 시그널 [EVENT] %s", reason)
 }
 
 type AlertPolicy struct {
@@ -461,4 +563,26 @@ func timeframeFromIntervalHour(hours int) string {
 		return "240"
 	}
 	return "240"
+}
+
+func watchlistSymbols(items []mongodb.WatchlistItem) []string {
+	if len(items) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(items))
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		symbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if symbol == "" {
+			continue
+		}
+		if _, exists := seen[symbol]; exists {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		result = append(result, symbol)
+	}
+
+	return result
 }
