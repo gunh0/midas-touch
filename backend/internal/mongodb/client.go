@@ -54,10 +54,19 @@ type WatchlistItem struct {
 	Symbol             string     `bson:"symbol" json:"symbol"`
 	AddedAt            time.Time  `bson:"added_at" json:"added_at"`
 	NotifyIntervalHour int        `bson:"notify_interval_hour" json:"notify_interval_hour"`
+	NotifyMode         string     `bson:"notify_mode" json:"notify_mode"`
 	Pinned             bool       `bson:"pinned" json:"pinned"`
 	SortOrder          int        `bson:"sort_order" json:"sort_order"`
 	LastNotifiedAt     *time.Time `bson:"last_notified_at,omitempty" json:"last_notified_at,omitempty"`
 	LastSpecialAt      *time.Time `bson:"last_special_at,omitempty" json:"last_special_at,omitempty"`
+}
+
+func normalizeNotifyMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "interval" {
+		return "interval"
+	}
+	return "event"
 }
 
 // DBStats holds storage usage info.
@@ -173,14 +182,30 @@ func (c *Client) GetRecentSignals(ctx context.Context, symbol string, limit int)
 	return docs, nil
 }
 
+func (c *Client) GetLatestNotifiedSignal(ctx context.Context, symbol string) (*SignalDoc, error) {
+	col := c.db.Collection(signalsCol)
+	opts := options.FindOne().SetSort(bson.D{{Key: "timestamp", Value: -1}})
+
+	var doc SignalDoc
+	err := col.FindOne(ctx, bson.D{{Key: "symbol", Value: symbol}, {Key: "notified", Value: true}}, opts).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &doc, nil
+}
+
 // ── Watchlist ──────────────────────────────────────────────────────────────
 
-// AddToWatchlist adds a symbol (upsert — no duplicates) and updates notify interval.
-func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyIntervalHour int) error {
+// AddToWatchlist adds a symbol (upsert — no duplicates) and updates notify settings.
+func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyIntervalHour int, notifyMode string) error {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	if notifyIntervalHour <= 0 {
 		notifyIntervalHour = 4
 	}
+	notifyMode = normalizeNotifyMode(notifyMode)
 	order, err := c.nextWatchlistOrder(ctx)
 	if err != nil {
 		return err
@@ -193,7 +218,7 @@ func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyInterv
 			{Key: "pinned", Value: false},
 			{Key: "sort_order", Value: order},
 		}},
-		{Key: "$set", Value: bson.D{{Key: "notify_interval_hour", Value: notifyIntervalHour}}},
+		{Key: "$set", Value: bson.D{{Key: "notify_interval_hour", Value: notifyIntervalHour}, {Key: "notify_mode", Value: notifyMode}}},
 	}
 	opts := options.UpdateOne().SetUpsert(true)
 	_, err = c.db.Collection(watchlistCol).UpdateOne(ctx, filter, update, opts)
@@ -264,6 +289,9 @@ func (c *Client) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 	for i := range items {
 		if items[i].NotifyIntervalHour <= 0 {
 			items[i].NotifyIntervalHour = 4
+		}
+		if items[i].NotifyMode == "" {
+			items[i].NotifyMode = "event"
 		}
 		if items[i].SortOrder <= 0 {
 			items[i].SortOrder = i

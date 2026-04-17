@@ -390,6 +390,7 @@ func (h *Handler) getWatchlist(c *gin.Context) {
 func (h *Handler) addWatchlist(c *gin.Context) {
 	symbol := service.NormalizeSymbol(c.Query("symbol"))
 	notifyHours := 4
+	notifyMode := c.DefaultQuery("notify_mode", "event")
 	if n := c.Query("notify_interval_hours"); n != "" {
 		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
 			notifyHours = parsed
@@ -398,11 +399,11 @@ func (h *Handler) addWatchlist(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
-	if err := h.db.AddToWatchlist(ctx, symbol, notifyHours); err != nil {
+	if err := h.db.AddToWatchlist(ctx, symbol, notifyHours, notifyMode); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "notify_interval_hours": notifyHours})
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "notify_interval_hours": notifyHours, "notify_mode": notifyMode})
 }
 
 func (h *Handler) removeWatchlist(c *gin.Context) {

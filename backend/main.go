@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +30,7 @@ const (
 	defaultIntervalHour   = 4
 	monitorTickInterval   = 5 * time.Minute
 	specialCooldownPeriod = 60 * time.Minute
+	popularScanTF         = "120"
 	dbFreeTierLimitMB     = 500.0
 	dbAlertThresholdRatio = 0.80
 	dbAlertCooldown       = 6 * time.Hour
@@ -78,6 +81,38 @@ func main() {
 
 	runOnce := parseBool(os.Getenv("ADVISOR_RUN_ONCE"))
 	var lastDBUsageAlertAt time.Time
+	alertCooldownMins := parseIntWithDefault(os.Getenv("ALERT_COOLDOWN_MINUTES"), 45)
+	if alertCooldownMins < 0 {
+		alertCooldownMins = 0
+	}
+	alertMinActionPct := parseFloatWithDefault(os.Getenv("ALERT_MIN_ACTION_PCT"), 60)
+	if alertMinActionPct < 0 {
+		alertMinActionPct = 0
+	}
+	if alertMinActionPct > 100 {
+		alertMinActionPct = 100
+	}
+	alertMinDeltaPct := parseFloatWithDefault(os.Getenv("ALERT_MIN_DELTA_PCT"), 12)
+	if alertMinDeltaPct < 0 {
+		alertMinDeltaPct = 0
+	}
+	policy := AlertPolicy{
+		MinActionPct: alertMinActionPct,
+		MinDeltaPct:  alertMinDeltaPct,
+		Cooldown:     time.Duration(alertCooldownMins) * time.Minute,
+	}
+	popularScanInterval := parseIntWithDefault(os.Getenv("POPULAR_SCAN_INTERVAL_HOURS"), 4)
+	if popularScanInterval <= 0 {
+		popularScanInterval = 4
+	}
+	popularBuyMinPct := parseFloatWithDefault(os.Getenv("POPULAR_BUY_MIN_PCT"), 55)
+	if popularBuyMinPct < 0 {
+		popularBuyMinPct = 0
+	}
+	if popularBuyMinPct > 100 {
+		popularBuyMinPct = 100
+	}
+	var lastPopularScanAt time.Time
 
 	monitorOnce := func() {
 		now := time.Now()
@@ -117,7 +152,7 @@ func main() {
 			return
 		}
 		if len(items) == 0 {
-			if err := db.AddToWatchlist(ctx, defaultSymbol, defaultIntervalHour); err != nil {
+			if err := db.AddToWatchlist(ctx, defaultSymbol, defaultIntervalHour, "event"); err != nil {
 				log.Printf("seed watchlist: %v", err)
 				return
 			}
@@ -130,6 +165,10 @@ func main() {
 				intervalHour = defaultIntervalHour
 			}
 			timingTF := timeframeFromIntervalHour(intervalHour)
+			notifyMode := strings.ToLower(strings.TrimSpace(item.NotifyMode))
+			if notifyMode == "" {
+				notifyMode = "event"
+			}
 
 			reco, err := signalSvc.Evaluate(ctx, item.Symbol, timingTF)
 			if err != nil {
@@ -141,15 +180,40 @@ func main() {
 				log.Printf("warn: auto prune %s: %v", item.Symbol, err)
 			}
 
-			normalDue := item.LastNotifiedAt == nil || now.Sub(*item.LastNotifiedAt) >= time.Duration(intervalHour)*time.Hour
-			specialDue := reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
-			if !normalDue && !specialDue {
+			shouldNotify := false
+			specialDue := false
+			why := ""
+
+			if notifyMode == "interval" {
+				normalDue := item.LastNotifiedAt == nil || now.Sub(*item.LastNotifiedAt) >= time.Duration(intervalHour)*time.Hour
+				specialDue = reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
+				shouldNotify = normalDue || specialDue
+				if specialDue && !normalDue {
+					why = fmt.Sprintf("interval mode + special override (%dh)", intervalHour)
+				} else if normalDue {
+					why = fmt.Sprintf("interval due (%dh)", intervalHour)
+				} else {
+					why = "interval wait"
+				}
+			} else {
+				lastNotified, err := db.GetLatestNotifiedSignal(ctx, item.Symbol)
+				if err != nil {
+					log.Printf("warn: latest notified signal %s: %v", item.Symbol, err)
+					continue
+				}
+				shouldNotify, specialDue, why = shouldNotifyEvent(reco, lastNotified, item, policy, now)
+			}
+
+			if !shouldNotify {
+				log.Printf("skip notify symbol=%s action=%s mode=%s reason=%s", item.Symbol, reco.Action, notifyMode, why)
 				continue
 			}
 
 			msg := advisor.FormatMessage(reco)
-			if specialDue && !normalDue {
-				msg = "[SPECIAL SIGNAL] interval override triggered\n\n" + msg
+			if specialDue {
+				msg = fmt.Sprintf("[SPECIAL SIGNAL][%s] %s\n\n%s", strings.ToUpper(notifyMode), why, msg)
+			} else {
+				msg = fmt.Sprintf("[%s] %s\n\n%s", strings.ToUpper(notifyMode), why, msg)
 			}
 
 			if err := tgClient.SendMessage(msg); err != nil {
@@ -161,7 +225,38 @@ func main() {
 			if err := db.MarkWatchlistNotified(ctx, item.Symbol, specialDue, now); err != nil {
 				log.Printf("warn: mark notified %s: %v", item.Symbol, err)
 			}
-			log.Printf("notified symbol=%s action=%s interval=%dh special=%t", item.Symbol, reco.Action, intervalHour, specialDue)
+			log.Printf("notified symbol=%s action=%s mode=%s special=%t reason=%s", item.Symbol, reco.Action, notifyMode, specialDue, why)
+		}
+
+		if lastPopularScanAt.IsZero() || now.Sub(lastPopularScanAt) >= time.Duration(popularScanInterval)*time.Hour {
+			symbols := advisor.PopularLeaderSymbols()
+			candidates := make([]advisor.Recommendation, 0, len(symbols))
+
+			for _, symbol := range symbols {
+				reco, err := signalSvc.Evaluate(ctx, symbol, popularScanTF)
+				if err != nil {
+					log.Printf("popular scan evaluate %s: %v", symbol, err)
+					continue
+				}
+
+				signalSvc.SaveSignal(ctx, symbol, reco, false)
+				if isBuyCandidate(reco, popularBuyMinPct) {
+					candidates = append(candidates, reco)
+				}
+			}
+
+			if len(candidates) > 0 {
+				msg := formatPopularBuyDigest(candidates, popularBuyMinPct)
+				if err := tgClient.SendMessage(msg); err != nil {
+					log.Printf("popular scan telegram send: %v", err)
+				} else {
+					log.Printf("popular scan notified: %d candidates", len(candidates))
+				}
+			} else {
+				log.Printf("popular scan: no BUY candidates (min_buy_pct=%.0f)", popularBuyMinPct)
+			}
+
+			lastPopularScanAt = now
 		}
 	}
 
@@ -204,6 +299,155 @@ func parseBool(value string) bool {
 		return false
 	}
 	return b
+}
+
+func parseIntWithDefault(value string, fallback int) int {
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func parseFloatWithDefault(value string, fallback float64) float64 {
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func isBuyCandidate(reco advisor.Recommendation, minBuyPct float64) bool {
+	if reco.Action != "BUY" {
+		return false
+	}
+	if reco.BuyPercent < minBuyPct {
+		return false
+	}
+	if reco.TrendAction == "SELL" || reco.TimingAction == "SELL" {
+		return false
+	}
+	return true
+}
+
+func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float64) string {
+	b := strings.Builder{}
+	b.WriteString("Popular Leaders Scan (인기 대장주 스캔)\n")
+	b.WriteString(fmt.Sprintf("조건: BUY && Buy>=%.0f%%\n", minBuyPct))
+	b.WriteString(fmt.Sprintf("시간: %s\n\n", time.Now().Format("2006-01-02 15:04 KST")))
+
+	for _, reco := range candidates {
+		b.WriteString(fmt.Sprintf(
+			"[%s] %s %s\n- Buy %.0f%% | Hold %.0f%% | Sell %.0f%%\n- Direction: %s %s | Timing: %s %s\n\n",
+			reco.TargetSymbol,
+			actionSignalEmoji(reco.Action),
+			actionWithKorean(reco.Action),
+			reco.BuyPercent,
+			reco.HoldPercent,
+			reco.SellPercent,
+			actionSignalEmoji(reco.TrendAction),
+			actionWithKorean(reco.TrendAction),
+			actionSignalEmoji(reco.TimingAction),
+			actionWithKorean(reco.TimingAction),
+		))
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func actionWithKorean(action string) string {
+	switch action {
+	case "BUY":
+		return "BUY(구매)"
+	case "SELL":
+		return "SELL(매도)"
+	case "HOLD":
+		return "HOLD(관망)"
+	default:
+		return action
+	}
+}
+
+func actionSignalEmoji(action string) string {
+	switch strings.ToUpper(strings.TrimSpace(action)) {
+	case "BUY":
+		return "🟢"
+	case "SELL":
+		return "🔴"
+	case "HOLD":
+		return "🟡"
+	default:
+		return "⚪"
+	}
+}
+
+type AlertPolicy struct {
+	MinActionPct float64
+	MinDeltaPct  float64
+	Cooldown     time.Duration
+}
+
+func shouldNotifyEvent(reco advisor.Recommendation, last *mongodb.SignalDoc, item mongodb.WatchlistItem, policy AlertPolicy, now time.Time) (bool, bool, string) {
+	specialDue := reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
+	if specialDue {
+		return true, true, "special signal"
+	}
+
+	if item.LastNotifiedAt != nil && now.Sub(*item.LastNotifiedAt) < policy.Cooldown {
+		return false, false, "cooldown"
+	}
+
+	if reco.Action == "HOLD" {
+		return false, false, "hold filtered"
+	}
+
+	currStrength := actionStrengthFromRecommendation(reco)
+	if currStrength < policy.MinActionPct {
+		return false, false, fmt.Sprintf("weak confidence %.0f<%.0f", currStrength, policy.MinActionPct)
+	}
+
+	if last == nil {
+		return true, false, "first actionable signal"
+	}
+
+	if reco.Action != last.Action {
+		return true, false, fmt.Sprintf("action changed %s->%s", last.Action, reco.Action)
+	}
+
+	lastStrength := actionStrengthFromSignal(*last)
+	if math.Abs(currStrength-lastStrength) >= policy.MinDeltaPct {
+		return true, false, fmt.Sprintf("confidence changed %.0f->%.0f", lastStrength, currStrength)
+	}
+
+	return false, false, "no meaningful change"
+}
+
+func actionStrengthFromRecommendation(reco advisor.Recommendation) float64 {
+	switch reco.Action {
+	case "BUY":
+		return reco.BuyPercent
+	case "SELL":
+		return reco.SellPercent
+	default:
+		return reco.HoldPercent
+	}
+}
+
+func actionStrengthFromSignal(sig mongodb.SignalDoc) float64 {
+	switch sig.Action {
+	case "BUY":
+		return sig.BuyPct
+	case "SELL":
+		return sig.SellPct
+	default:
+		return sig.HoldPct
+	}
 }
 
 func timeframeFromIntervalHour(hours int) string {

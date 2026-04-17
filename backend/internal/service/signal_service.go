@@ -133,6 +133,7 @@ func (s *SignalService) Evaluate(ctx context.Context, symbol, timingTF string) (
 	if err != nil {
 		return advisor.Recommendation{}, fmt.Errorf("evaluate %s: %w", symbol, err)
 	}
+	reco.TimingTF = timingTF
 	reco.USDKRWRate = usdkrw
 
 	return reco, nil
