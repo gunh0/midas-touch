@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -89,9 +89,9 @@ interface SourceStatus {
 interface ScanRow {
   symbol: string;
   signal: Signal;
-  companyName?: string;
-  exchange?: string;
-  typeLabel?: string;
+  companyName: string;
+  exchange: string;
+  typeLabel: string;
 }
 
 const MARKET_CAP_BASE_SYMBOLS = [
@@ -326,16 +326,16 @@ function WatchlistPanel({
   const [saving, setSaving] = useState(false);
   const [draggingSymbol, setDraggingSymbol] = useState<string | null>(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const data = await fetchJSON<WatchlistItem[]>("/api/watchlist");
       const next = data ?? [];
       setItems(next);
       onItemsChange?.(next);
     } catch { /* ignore */ }
-  };
+  }, [onItemsChange]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
     if (input.trim().length < 2) {
@@ -1507,6 +1507,8 @@ export default function Dashboard() {
         </div>
 
         <div className="space-y-4">
+          <WatchlistPanel onSelect={handleAnalyze} onItemsChange={setWatchlistItems} />
+
           {signal && (
             <div className={`rounded-xl border p-4 ${actionBg(signal.action)}`}>
               <div className="flex items-center justify-between mb-3"><h2 className="font-semibold text-slate-200">Overall Signal</h2><span className={`text-2xl font-black ${actionColor(signal.action)}`}>{signal.action}</span></div>
