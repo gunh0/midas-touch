@@ -1,12 +1,59 @@
 @import "tailwindcss";
 
 :root {
-  --background: #0f1117;
-  --foreground: #e2e8f0;
+  --background: #090d14;
+  --foreground: #dbe5ff;
+  --surface: #111a2a;
+  --surface-2: #0f1624;
+  --line: #22324b;
+  --accent: #2dd4bf;
+  --accent-2: #67e8f9;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-grotesk), "Segoe UI", sans-serif;
+  background-image:
+    radial-gradient(1200px 600px at 8% -10%, rgba(45, 212, 191, 0.12), transparent 55%),
+    radial-gradient(1000px 500px at 100% 0%, rgba(103, 232, 249, 0.08), transparent 50%),
+    linear-gradient(180deg, #070b12 0%, #090d14 40%, #090d14 100%);
+}
+
+code,
+.font-mono {
+  font-family: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.scan-grid {
+  background-image:
+    linear-gradient(to right, rgba(34, 50, 75, 0.45) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(34, 50, 75, 0.45) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+.glass-panel {
+  background: linear-gradient(180deg, rgba(20, 31, 48, 0.82), rgba(13, 21, 34, 0.82));
+  border: 1px solid rgba(95, 132, 184, 0.25);
+  box-shadow: inset 0 1px 0 rgba(184, 221, 255, 0.05), 0 14px 40px rgba(2, 8, 20, 0.45);
+}
+
+.scan-ambient {
+  position: relative;
+}
+
+.scan-ambient::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  background: linear-gradient(110deg, transparent 0%, rgba(103, 232, 249, 0.08) 46%, transparent 100%);
+  animation: scanSweep 5.8s linear infinite;
+}
+
+@keyframes scanSweep {
+  0% { transform: translateX(-55%); opacity: 0.2; }
+  42% { opacity: 0.35; }
+  100% { transform: translateX(60%); opacity: 0.1; }
 }
