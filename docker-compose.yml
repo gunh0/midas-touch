@@ -1,5 +1,6 @@
 services:
   backend:
+    container_name: midas-touch-backend
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -19,6 +20,7 @@ services:
       retries: 3
 
   frontend:
+    container_name: midas-touch-frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile

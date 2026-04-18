@@ -50,9 +50,16 @@ func NewRouter(h *Handler) *gin.Engine {
 	api := r.Group("/api")
 	{
 		api.GET("/health", h.health)
+		api.GET("/universe", h.getUniverse)
+		api.POST("/universe", h.addUniverse)
+		api.DELETE("/universe", h.removeUniverse)
+		api.GET("/view-history", h.getViewHistory)
+		api.POST("/view-history", h.touchViewHistory)
+		api.DELETE("/view-history", h.removeViewHistory)
 		api.GET("/sources/status", h.sourcesStatus)
 		api.GET("/candles", h.candles)
 		api.GET("/signal", h.signal)
+		api.POST("/signals/batch", h.signalsBatch)
 		api.GET("/signals", h.signals)
 		api.GET("/symbols/search", h.searchSymbols)
 		api.POST("/notify", h.notify)
@@ -253,30 +260,116 @@ func (h *Handler) signal(c *gin.Context) {
 		timingTF = "120"
 	}
 
-	reco, err := h.signalSvc.Evaluate(c.Request.Context(), symbol, timingTF)
+	reco, err := h.signalSvc.EvaluateCached(c.Request.Context(), symbol, timingTF)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	h.signalSvc.SaveSignal(c.Request.Context(), symbol, reco, false)
+	c.JSON(http.StatusOK, h.signalPayload(reco))
+}
 
-	c.JSON(http.StatusOK, gin.H{
+func (h *Handler) signalPayload(reco advisor.Recommendation) gin.H {
+	return gin.H{
 		"symbol":            reco.TargetSymbol,
 		"action":            reco.Action,
 		"trend_action":      reco.TrendAction,
 		"timing_action":     reco.TimingAction,
+		"weekly_action":     reco.WeeklyAction,
 		"is_special_signal": reco.IsSpecial,
 		"buy_pct":           reco.BuyPercent,
 		"sell_pct":          reco.SellPercent,
 		"hold_pct":          reco.HoldPercent,
 		"reason":            reco.Reason,
+		"timeframe_bias":    reco.TimeframeBias,
 		"indicators":        reco.Indicators,
 		"timing_indicators": reco.Timing,
 		"score":             reco.Score,
 		"timing_score":      reco.TimingScore,
 		"timestamp":         reco.Timestamp,
-	})
+	}
+}
+
+type signalBatchRequest struct {
+	Symbols []string `json:"symbols"`
+}
+
+func (h *Handler) signalsBatch(c *gin.Context) {
+	var req signalBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	timingTF := service.NormalizeTimeframe(c.Query("timing_tf"))
+	if timingTF == "1d" {
+		timingTF = "120"
+	}
+
+	normalized := make([]string, 0, len(req.Symbols))
+	seen := map[string]struct{}{}
+	for _, sym := range req.Symbols {
+		n := service.NormalizeSymbol(sym)
+		if n == "" {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		normalized = append(normalized, n)
+	}
+
+	if len(normalized) == 0 {
+		c.JSON(http.StatusOK, []gin.H{})
+		return
+	}
+
+	workerCount := 4
+	if workerCount > len(normalized) {
+		workerCount = len(normalized)
+	}
+
+	results := make([]gin.H, len(normalized))
+	indexBySymbol := make(map[string]int, len(normalized))
+	for i, sym := range normalized {
+		indexBySymbol[sym] = i
+	}
+
+	jobs := make(chan string, len(normalized))
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range jobs {
+				reco, err := h.signalSvc.EvaluateCached(c.Request.Context(), sym, timingTF)
+				idx := indexBySymbol[sym]
+				if err != nil {
+					results[idx] = gin.H{"symbol": sym, "error": err.Error()}
+					continue
+				}
+				h.signalSvc.SaveSignal(c.Request.Context(), sym, reco, false)
+				results[idx] = h.signalPayload(reco)
+			}
+		}()
+	}
+
+	for _, sym := range normalized {
+		jobs <- sym
+	}
+	close(jobs)
+	wg.Wait()
+
+	out := make([]gin.H, 0, len(results))
+	for _, row := range results {
+		if row != nil {
+			out = append(out, row)
+		}
+	}
+
+	c.JSON(http.StatusOK, out)
 }
 
 // notify godoc
@@ -392,21 +485,26 @@ func (h *Handler) getWatchlist(c *gin.Context) {
 
 func (h *Handler) addWatchlist(c *gin.Context) {
 	symbol := service.NormalizeSymbol(c.Query("symbol"))
-	notifyHours := 4
+	notifyMinutes := 3
 	notifyMode := c.DefaultQuery("notify_mode", "event")
+	if n := c.Query("notify_interval_minutes"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			notifyMinutes = parsed
+		}
+	}
 	if n := c.Query("notify_interval_hours"); n != "" {
 		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
-			notifyHours = parsed
+			notifyMinutes = parsed * 60
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
-	if err := h.db.AddToWatchlist(ctx, symbol, notifyHours, notifyMode); err != nil {
+	if err := h.db.AddToWatchlist(ctx, symbol, notifyMinutes, notifyMode); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "notify_interval_hours": notifyHours, "notify_mode": notifyMode})
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "notify_interval_minutes": notifyMinutes, "notify_mode": notifyMode})
 }
 
 func (h *Handler) removeWatchlist(c *gin.Context) {
@@ -414,6 +512,91 @@ func (h *Handler) removeWatchlist(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	if err := h.db.RemoveFromWatchlist(ctx, symbol); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol})
+}
+
+func (h *Handler) getUniverse(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	docs, err := h.db.GetUniverseSymbols(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(docs) == 0 {
+		if err := h.db.EnsureBaseUniverse(ctx, advisor.PopularLeaderSymbols()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		docs, err = h.db.GetUniverseSymbols(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, docs)
+}
+
+func (h *Handler) addUniverse(c *gin.Context) {
+	symbol := service.NormalizeSymbol(c.Query("symbol"))
+	kind := strings.TrimSpace(c.DefaultQuery("kind", "custom"))
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.AddUniverseSymbol(ctx, symbol, kind); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "kind": kind})
+}
+
+func (h *Handler) removeUniverse(c *gin.Context) {
+	symbol := service.NormalizeSymbol(c.Query("symbol"))
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.RemoveUniverseSymbol(ctx, symbol); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.db.RemoveFromWatchlist(ctx, symbol)
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol})
+}
+
+func (h *Handler) getViewHistory(c *gin.Context) {
+	limit := 20
+	if q := c.Query("limit"); q != "" {
+		if parsed, err := strconv.Atoi(q); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	history, err := h.db.GetViewHistory(ctx, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, history)
+}
+
+func (h *Handler) touchViewHistory(c *gin.Context) {
+	symbol := service.NormalizeSymbol(c.Query("symbol"))
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.TouchViewHistory(ctx, symbol, 20); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol})
+}
+
+func (h *Handler) removeViewHistory(c *gin.Context) {
+	symbol := service.NormalizeSymbol(c.Query("symbol"))
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.RemoveViewHistorySymbol(ctx, symbol); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

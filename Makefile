@@ -1,10 +1,10 @@
-.PHONY: dev dev-front dev-back dev-back-run swagger build stop logs deploy kill-port-8000
+.PHONY: up down dev-front dev-back dev-back-run swagger build logs deploy kill-port-8000 test-back test-back-integration
 
 # ── Local development ──────────────────────────────────────────────────────
-dev:
+up:
 	docker compose up --build
 
-stop:
+down:
 	docker compose down
 
 logs:
@@ -53,3 +53,10 @@ deploy:
 	git fetch origin
 	git pull origin main
 	docker compose up -d --build
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+test-back:
+	cd backend && go test ./...
+
+test-back-integration:
+	cd backend && go test ./tests/...

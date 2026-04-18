@@ -3,6 +3,7 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ const (
 	candlesCol   = "candles"
 	signalsCol   = "signals"
 	watchlistCol = "watchlist"
+	universeCol  = "universe_symbols"
+	historyCol   = "view_history"
 	maxStorageMB = 450 // warn threshold (out of 500MB free tier)
 )
 
@@ -51,14 +54,43 @@ type SignalDoc struct {
 
 // WatchlistItem is a user-registered symbol.
 type WatchlistItem struct {
-	Symbol             string     `bson:"symbol" json:"symbol"`
-	AddedAt            time.Time  `bson:"added_at" json:"added_at"`
-	NotifyIntervalHour int        `bson:"notify_interval_hour" json:"notify_interval_hour"`
-	NotifyMode         string     `bson:"notify_mode" json:"notify_mode"`
-	Pinned             bool       `bson:"pinned" json:"pinned"`
-	SortOrder          int        `bson:"sort_order" json:"sort_order"`
-	LastNotifiedAt     *time.Time `bson:"last_notified_at,omitempty" json:"last_notified_at,omitempty"`
-	LastSpecialAt      *time.Time `bson:"last_special_at,omitempty" json:"last_special_at,omitempty"`
+	Symbol               string     `bson:"symbol" json:"symbol"`
+	AddedAt              time.Time  `bson:"added_at" json:"added_at"`
+	NotifyIntervalMinute int        `bson:"notify_interval_minute,omitempty" json:"notify_interval_minute,omitempty"`
+	NotifyIntervalHour   int        `bson:"notify_interval_hour" json:"notify_interval_hour"`
+	NotifyMode           string     `bson:"notify_mode" json:"notify_mode"`
+	Pinned               bool       `bson:"pinned" json:"pinned"`
+	SortOrder            int        `bson:"sort_order" json:"sort_order"`
+	LastNotifiedAt       *time.Time `bson:"last_notified_at,omitempty" json:"last_notified_at,omitempty"`
+	LastSpecialAt        *time.Time `bson:"last_special_at,omitempty" json:"last_special_at,omitempty"`
+}
+
+type UniverseSymbolDoc struct {
+	Symbol    string    `bson:"symbol" json:"symbol"`
+	Kind      string    `bson:"kind" json:"kind"` // base | custom
+	AddedAt   time.Time `bson:"added_at" json:"added_at"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+type ViewHistoryDoc struct {
+	Symbol     string    `bson:"symbol" json:"symbol"`
+	LastViewed time.Time `bson:"last_viewed" json:"last_viewed"`
+}
+
+func normalizeNotifyIntervalMinute(minute, hour int) int {
+	if minute <= 0 && hour > 0 {
+		minute = hour * 60
+	}
+	if minute <= 0 {
+		minute = 3
+	}
+	if minute < 1 {
+		minute = 1
+	}
+	if minute > 24*60 {
+		minute = 24 * 60
+	}
+	return minute
 }
 
 func normalizeNotifyMode(mode string) string {
@@ -93,7 +125,134 @@ func NewClient(ctx context.Context) (*Client, error) {
 		return nil, fmt.Errorf("ping mongodb: %w", err)
 	}
 
-	return &Client{db: client.Database(dbName)}, nil
+	db := client.Database(dbName)
+	c := &Client{db: db}
+	if err := c.ensureIndexes(ctx); err != nil {
+		return nil, fmt.Errorf("ensure indexes: %w", err)
+	}
+
+	return c, nil
+}
+
+func (c *Client) ensureIndexes(ctx context.Context) error {
+	// candles: fast latest retrieval and conflict-free upsert on OHLC key.
+	candleIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}, {Key: "timeframe", Value: 1}, {Key: "timestamp", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uq_candle_symbol_tf_ts"),
+		},
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}, {Key: "timeframe", Value: 1}, {Key: "timestamp", Value: -1}},
+			Options: options.Index().SetName("idx_candle_symbol_tf_ts_desc"),
+		},
+	}
+	if _, err := c.db.Collection(candlesCol).Indexes().CreateMany(ctx, candleIndexes); err != nil {
+		if strings.Contains(err.Error(), "E11000 duplicate key error") {
+			if dedupeErr := c.deduplicateCandles(ctx); dedupeErr != nil {
+				return dedupeErr
+			}
+			if _, retryErr := c.db.Collection(candlesCol).Indexes().CreateMany(ctx, candleIndexes); retryErr != nil {
+				return retryErr
+			}
+		} else {
+			return err
+		}
+	}
+
+	// signals: latest notified/recent signal lookups.
+	if _, err := c.db.Collection(signalsCol).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}, {Key: "timestamp", Value: -1}},
+			Options: options.Index().SetName("idx_signal_symbol_ts_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}, {Key: "notified", Value: 1}, {Key: "timestamp", Value: -1}},
+			Options: options.Index().SetName("idx_signal_symbol_notified_ts_desc"),
+		},
+	}); err != nil {
+		return err
+	}
+
+	// watchlist: unique symbol and sort path used by GET /watchlist.
+	if _, err := c.db.Collection(watchlistCol).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uq_watchlist_symbol"),
+		},
+		{
+			Keys:    bson.D{{Key: "pinned", Value: -1}, {Key: "sort_order", Value: 1}, {Key: "symbol", Value: 1}},
+			Options: options.Index().SetName("idx_watchlist_pinned_sort_symbol"),
+		},
+	}); err != nil {
+		return err
+	}
+
+	// universe/history: unique symbol and recency sort.
+	if _, err := c.db.Collection(universeCol).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uq_universe_symbol"),
+		},
+		{
+			Keys:    bson.D{{Key: "kind", Value: 1}, {Key: "updated_at", Value: -1}},
+			Options: options.Index().SetName("idx_universe_kind_updated_desc"),
+		},
+	}); err != nil {
+		return err
+	}
+
+	if _, err := c.db.Collection(historyCol).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "symbol", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uq_history_symbol"),
+		},
+		{
+			Keys:    bson.D{{Key: "last_viewed", Value: -1}},
+			Options: options.Index().SetName("idx_history_last_viewed_desc"),
+		},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type duplicateCandleGroup struct {
+	IDs []bson.ObjectID `bson:"ids"`
+}
+
+func (c *Client) deduplicateCandles(ctx context.Context) error {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "symbol", Value: "$symbol"}, {Key: "timeframe", Value: "$timeframe"}, {Key: "timestamp", Value: "$timestamp"}}},
+			{Key: "ids", Value: bson.D{{Key: "$push", Value: "$_id"}}},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+		bson.D{{Key: "$match", Value: bson.D{{Key: "count", Value: bson.D{{Key: "$gt", Value: 1}}}}}},
+	}
+
+	cursor, err := c.db.Collection(candlesCol).Aggregate(ctx, pipeline)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var grp duplicateCandleGroup
+		if err := cursor.Decode(&grp); err != nil {
+			return err
+		}
+		if len(grp.IDs) <= 1 {
+			continue
+		}
+		obsoleteIDs := grp.IDs[1:]
+		_, err := c.db.Collection(candlesCol).DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: obsoleteIDs}}}})
+		if err != nil {
+			return err
+		}
+	}
+
+	return cursor.Err()
 }
 
 // ── Candles ────────────────────────────────────────────────────────────────
@@ -199,11 +358,13 @@ func (c *Client) GetLatestNotifiedSignal(ctx context.Context, symbol string) (*S
 
 // ── Watchlist ──────────────────────────────────────────────────────────────
 
-// AddToWatchlist adds a symbol (upsert — no duplicates) and updates notify settings.
-func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyIntervalHour int, notifyMode string) error {
+// AddToWatchlist adds a symbol (upsert - no duplicates) and updates notify settings.
+func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyIntervalMinute int, notifyMode string) error {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	if notifyIntervalHour <= 0 {
-		notifyIntervalHour = 4
+	notifyIntervalMinute = normalizeNotifyIntervalMinute(notifyIntervalMinute, 0)
+	notifyIntervalHour := int(math.Ceil(float64(notifyIntervalMinute) / 60.0))
+	if notifyIntervalHour < 1 {
+		notifyIntervalHour = 1
 	}
 	notifyMode = normalizeNotifyMode(notifyMode)
 	order, err := c.nextWatchlistOrder(ctx)
@@ -218,7 +379,11 @@ func (c *Client) AddToWatchlist(ctx context.Context, symbol string, notifyInterv
 			{Key: "pinned", Value: false},
 			{Key: "sort_order", Value: order},
 		}},
-		{Key: "$set", Value: bson.D{{Key: "notify_interval_hour", Value: notifyIntervalHour}, {Key: "notify_mode", Value: notifyMode}}},
+		{Key: "$set", Value: bson.D{
+			{Key: "notify_interval_minute", Value: notifyIntervalMinute},
+			{Key: "notify_interval_hour", Value: notifyIntervalHour},
+			{Key: "notify_mode", Value: notifyMode},
+		}},
 	}
 	opts := options.UpdateOne().SetUpsert(true)
 	_, err = c.db.Collection(watchlistCol).UpdateOne(ctx, filter, update, opts)
@@ -287,9 +452,8 @@ func (c *Client) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 		return nil, err
 	}
 	for i := range items {
-		if items[i].NotifyIntervalHour <= 0 {
-			items[i].NotifyIntervalHour = 4
-		}
+		items[i].NotifyIntervalMinute = normalizeNotifyIntervalMinute(items[i].NotifyIntervalMinute, items[i].NotifyIntervalHour)
+		items[i].NotifyIntervalHour = int(math.Ceil(float64(items[i].NotifyIntervalMinute) / 60.0))
 		if items[i].NotifyMode == "" {
 			items[i].NotifyMode = "event"
 		}
@@ -311,6 +475,163 @@ func (c *Client) nextWatchlistOrder(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return last.SortOrder + 1, nil
+}
+
+// ── Managed Universe ───────────────────────────────────────────────────────
+
+func normalizeUniverseKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "custom" {
+		return "custom"
+	}
+	return "base"
+}
+
+func (c *Client) EnsureBaseUniverse(ctx context.Context, symbols []string) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+	col := c.db.Collection(universeCol)
+	now := time.Now()
+	models := make([]mongo.WriteModel, 0, len(symbols))
+	for _, sym := range symbols {
+		norm := strings.ToUpper(strings.TrimSpace(sym))
+		if norm == "" {
+			continue
+		}
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "symbol", Value: norm}}).
+			SetUpdate(bson.D{
+				{Key: "$setOnInsert", Value: bson.D{
+					{Key: "symbol", Value: norm},
+					{Key: "kind", Value: "base"},
+					{Key: "added_at", Value: now},
+					{Key: "updated_at", Value: now},
+				}},
+			}).
+			SetUpsert(true))
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	_, err := col.BulkWrite(ctx, models)
+	return err
+}
+
+func (c *Client) GetUniverseSymbols(ctx context.Context) ([]UniverseSymbolDoc, error) {
+	opts := options.Find().SetSort(bson.D{{Key: "kind", Value: 1}, {Key: "symbol", Value: 1}})
+	cursor, err := c.db.Collection(universeCol).Find(ctx, bson.D{}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var docs []UniverseSymbolDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+func (c *Client) AddUniverseSymbol(ctx context.Context, symbol, kind string) error {
+	norm := strings.ToUpper(strings.TrimSpace(symbol))
+	if norm == "" {
+		return nil
+	}
+	kind = normalizeUniverseKind(kind)
+	now := time.Now()
+	_, err := c.db.Collection(universeCol).UpdateOne(
+		ctx,
+		bson.D{{Key: "symbol", Value: norm}},
+		bson.D{
+			{Key: "$setOnInsert", Value: bson.D{{Key: "added_at", Value: now}}},
+			{Key: "$set", Value: bson.D{{Key: "symbol", Value: norm}, {Key: "kind", Value: kind}, {Key: "updated_at", Value: now}}},
+		},
+		options.UpdateOne().SetUpsert(true),
+	)
+	return err
+}
+
+func (c *Client) RemoveUniverseSymbol(ctx context.Context, symbol string) error {
+	norm := strings.ToUpper(strings.TrimSpace(symbol))
+	if norm == "" {
+		return nil
+	}
+	_, err := c.db.Collection(universeCol).DeleteOne(ctx, bson.D{{Key: "symbol", Value: norm}})
+	return err
+}
+
+// ── View History ───────────────────────────────────────────────────────────
+
+func (c *Client) TouchViewHistory(ctx context.Context, symbol string, limit int) error {
+	norm := strings.ToUpper(strings.TrimSpace(symbol))
+	if norm == "" {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	now := time.Now()
+	_, err := c.db.Collection(historyCol).UpdateOne(
+		ctx,
+		bson.D{{Key: "symbol", Value: norm}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "symbol", Value: norm}, {Key: "last_viewed", Value: now}}}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Keep only most recent `limit` symbols.
+	opts := options.Find().SetSort(bson.D{{Key: "last_viewed", Value: -1}})
+	cursor, err := c.db.Collection(historyCol).Find(ctx, bson.D{}, opts)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	var docs []ViewHistoryDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return err
+	}
+	if len(docs) <= limit {
+		return nil
+	}
+
+	obsolete := docs[limit:]
+	symbols := make([]string, 0, len(obsolete))
+	for _, d := range obsolete {
+		symbols = append(symbols, d.Symbol)
+	}
+	_, err = c.db.Collection(historyCol).DeleteMany(ctx, bson.D{{Key: "symbol", Value: bson.D{{Key: "$in", Value: symbols}}}})
+	return err
+}
+
+func (c *Client) GetViewHistory(ctx context.Context, limit int) ([]ViewHistoryDoc, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "last_viewed", Value: -1}}).SetLimit(int64(limit))
+	cursor, err := c.db.Collection(historyCol).Find(ctx, bson.D{}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var docs []ViewHistoryDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+func (c *Client) RemoveViewHistorySymbol(ctx context.Context, symbol string) error {
+	norm := strings.ToUpper(strings.TrimSpace(symbol))
+	if norm == "" {
+		return nil
+	}
+	_, err := c.db.Collection(historyCol).DeleteOne(ctx, bson.D{{Key: "symbol", Value: norm}})
+	return err
 }
 
 // ── DB Stats ───────────────────────────────────────────────────────────────

@@ -1,98 +1,37 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
-// ── Types ──────────────────────────────────────────────────────────────────
-interface CandleDoc {
-  symbol: string;
-  timestamp: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
-interface Indicators {
-  RSI14: number;
-  SMA20: number;
-  SMA50: number;
-  BBUpper: number;
-  BBMid: number;
-  BBLower: number;
-  SupertrendDir: number;
-  SupertrendLine: number;
-  ATR14: number;
-}
-
-interface Score {
-  RSIScore: number;
-  MAScore: number;
-  BBScore: number;
-  SupertrendScore: number;
-  Total: number;
-}
-
-interface Signal {
-  symbol: string;
-  action: string;
-  trend_action?: string;
-  timing_action?: string;
-  is_special_signal?: boolean;
-  buy_pct: number;
-  sell_pct: number;
-  hold_pct: number;
-  reason: string;
-  indicators: Indicators;
-  timing_indicators?: Indicators;
-  score: Score;
-  timing_score?: Score;
-  timestamp: string;
-}
-
-interface DBStats {
-  data_size_mb: number;
-  storage_size_mb: number;
-  collections: number;
-  objects: number;
-  over_limit: boolean;
-}
-
-interface WatchlistItem {
-  symbol: string;
-  added_at: string;
-  notify_interval_hour?: number;
-  notify_mode?: "event" | "interval" | string;
-  pinned?: boolean;
-  sort_order?: number;
-}
-
-interface SymbolSearchResult {
-  symbol: string;
-  name: string;
-  exchange: string;
-  type_display: string;
-}
-
-interface SourceStatus {
-  source: string;
-  ok: boolean;
-  latency_ms: number;
-  error?: string;
-  detail?: string;
-  checked_at: string;
-  score: number;
-}
-
-interface ScanRow {
-  symbol: string;
-  signal: Signal;
-  companyName: string;
-  exchange: string;
-  typeLabel: string;
-}
+import { useCallback, useEffect, useState } from "react";
+import { API_BASE, fetchJSON } from "./dashboard/api";
+import { CandleChart } from "./dashboard/components/CandleChart";
+import { DailyClose30Panel } from "./dashboard/components/DailyClose30Panel";
+import { DBStatsPanel } from "./dashboard/components/DBStatsPanel";
+import { Hourly7DayPanel } from "./dashboard/components/Hourly7DayPanel";
+import { IndicatorRow } from "./dashboard/components/IndicatorRow";
+import { ProbBar } from "./dashboard/components/ProbBar";
+import { ScoreBar } from "./dashboard/components/ScoreBar";
+import { SourceStatusPanel } from "./dashboard/components/SourceStatusPanel";
+import type {
+  CandleDoc,
+  ScanRow,
+  Signal,
+  SymbolSearchResult,
+  UniverseSymbol,
+  ViewHistoryRow,
+  WatchlistItem,
+} from "./dashboard/types";
+import {
+  actionBg,
+  actionColor,
+  actionEmoji,
+  formatPrice,
+  inferCountryFromExchange,
+  intervalShortLabel,
+  normalizeTypeLabel,
+  notifyModeLabel,
+  scanScoreClass,
+  topListScore,
+  typeBadgeClass,
+} from "./dashboard/utils";
 
 const MARKET_CAP_BASE_SYMBOLS = [
   "TQQQ", "QQQ", "SPY", "SOXL", "SOXX",
@@ -100,733 +39,13 @@ const MARKET_CAP_BASE_SYMBOLS = [
 ];
 
 const SCAN_TF = "120";
-const CUSTOM_UNIVERSE_STORAGE_KEY = "midas.custom.universe.symbols";
-const EXCLUDED_UNIVERSE_STORAGE_KEY = "midas.excluded.universe.symbols";
+
 const DASHBOARD_PREFS_STORAGE_KEY = "midas.dashboard.preferences";
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-async function fetchJSON<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
-  return res.json();
-}
-
-function actionColor(action: string) {
-  if (action === "BUY") return "text-emerald-400";
-  if (action === "SELL") return "text-red-400";
-  return "text-yellow-400";
-}
-
-function actionBg(action: string) {
-  if (action === "BUY") return "bg-emerald-500/20 border-emerald-500/40";
-  if (action === "SELL") return "bg-red-500/20 border-red-500/40";
-  return "bg-yellow-500/20 border-yellow-500/40";
-}
-
-function formatPrice(v: number) {
-  return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function formatPct(v: number) {
-  const sign = v >= 0 ? "+" : "";
-  return `${sign}${v.toFixed(2)}%`;
-}
-
-function notifyModeLabel(mode?: string) {
-  return mode === "interval" ? "Interval" : "Event";
-}
-
-function inferCountryFromExchange(exchange?: string) {
-  const ex = (exchange ?? "").toUpperCase();
-  if (ex.includes("NASDAQ") || ex.includes("NYSE") || ex.includes("AMEX") || ex === "NMS") return "US";
-  if (ex.includes("KOSPI") || ex.includes("KOSDAQ") || ex.includes("KRX")) return "KR";
-  if (ex.includes("TSE") || ex.includes("JPX")) return "JP";
-  if (ex.includes("LSE")) return "UK";
-  if (ex.includes("HKEX")) return "HK";
-  if (ex.includes("SSE") || ex.includes("SZSE")) return "CN";
-  return "-";
-}
-
-function normalizeTypeLabel(typeDisplay?: string) {
-  const t = (typeDisplay ?? "").toUpperCase();
-  if (t.includes("ETF")) return "ETF";
-  if (t.includes("EQUITY") || t.includes("COMMON") || t.includes("STOCK")) return "Stock";
-  if (!t) return "-";
-  return typeDisplay ?? "-";
-}
-
-function typeBadgeClass(typeLabel: string) {
-  if (typeLabel === "ETF") return "border-cyan-500/40 text-cyan-300 bg-cyan-500/10";
-  if (typeLabel === "Stock") return "border-emerald-500/40 text-emerald-300 bg-emerald-500/10";
-  return "border-slate-600 text-slate-300 bg-slate-700/40";
-}
-
-function actionEmoji(action: string) {
-  if (action === "BUY") return "🟢";
-  if (action === "SELL") return "🔴";
-  return "🟡";
-}
-
-function scanScoreClass(v: number) {
-  if (v >= 75) return "text-emerald-300";
-  if (v >= 60) return "text-cyan-300";
-  if (v >= 45) return "text-yellow-300";
-  return "text-slate-400";
-}
-
-// ── Candlestick chart (pure canvas) ───────────────────────────────────────
-function CandleChart({ candles }: { candles: CandleDoc[] }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || candles.length === 0) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const W = canvas.width;
-    const H = canvas.height;
-    if (W === 0 || H === 0) return;
-
-    const pad = { top: 20, bottom: 30, left: 10, right: 10 };
-    const chartW = W - pad.left - pad.right;
-    const chartH = H - pad.top - pad.bottom;
-
-    const recent = candles.slice(-120).filter((c) => c.close > 0);
-    if (recent.length === 0) return;
-
-    const highs = recent.map((c) => (c.high > 0 ? c.high : c.close));
-    const lows = recent.map((c) => (c.low > 0 ? c.low : c.close));
-    const maxP = highs.reduce((a, b) => Math.max(a, b), highs[0]);
-    const minP = lows.reduce((a, b) => Math.min(a, b), lows[0]);
-    const range = maxP - minP || 1;
-
-    const toY = (p: number) => pad.top + chartH - ((p - minP) / range) * chartH;
-    const barW = Math.max(1, Math.floor(chartW / recent.length) - 1);
-
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = "#0f1117";
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.strokeStyle = "#1e2535";
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.top + (chartH / 4) * i;
-      ctx.beginPath();
-      ctx.moveTo(pad.left, y);
-      ctx.lineTo(W - pad.right, y);
-      ctx.stroke();
-    }
-
-    recent.forEach((c, i) => {
-      const x = pad.left + (i / recent.length) * chartW;
-      const open = c.open > 0 ? c.open : c.close;
-      const close = c.close;
-      const high = c.high > 0 ? c.high : Math.max(open, close);
-      const low = c.low > 0 ? c.low : Math.min(open, close);
-      const isUp = close >= open;
-
-      ctx.strokeStyle = isUp ? "#34d399" : "#f87171";
-      ctx.fillStyle = isUp ? "#34d399" : "#f87171";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x + barW / 2, toY(high));
-      ctx.lineTo(x + barW / 2, toY(low));
-      ctx.stroke();
-
-      const bodyTop = toY(Math.max(open, close));
-      const bodyH = Math.max(1, Math.abs(toY(open) - toY(close)));
-      ctx.fillRect(x, bodyTop, barW, bodyH);
-    });
-
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "11px monospace";
-    ctx.fillText(`$${recent[recent.length - 1]?.close.toFixed(2)}`, pad.left + 4, pad.top - 4);
-  }, [candles]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      width={800}
-      height={300}
-      className="w-full rounded-lg"
-      style={{ imageRendering: "pixelated" }}
-    />
-  );
-}
-
-// ── Probability bar ────────────────────────────────────────────────────────
-function ProbBar({ buy, sell, hold }: { buy: number; sell: number; hold: number }) {
-  return (
-    <div className="w-full">
-      <div className="flex h-6 rounded overflow-hidden text-xs font-bold">
-        <div className="flex items-center justify-center bg-emerald-500 transition-all" style={{ width: `${buy}%` }}>
-          {buy >= 15 ? `${buy}%` : ""}
-        </div>
-        <div className="flex items-center justify-center bg-yellow-500 transition-all" style={{ width: `${hold}%` }}>
-          {hold >= 15 ? `${hold}%` : ""}
-        </div>
-        <div className="flex items-center justify-center bg-red-500 transition-all" style={{ width: `${sell}%` }}>
-          {sell >= 15 ? `${sell}%` : ""}
-        </div>
-      </div>
-      <div className="flex justify-between text-xs text-slate-400 mt-1">
-        <span className="text-emerald-400">Buy {buy}%</span>
-        <span className="text-yellow-400">Hold {hold}%</span>
-        <span className="text-red-400">Sell {sell}%</span>
-      </div>
-    </div>
-  );
-}
-
-// ── Score breakdown bar ────────────────────────────────────────────────────
-function ScoreBar({ label, value }: { label: string; value: number }) {
-  const pct = Math.abs(value) * 100;
-  const isPos = value >= 0;
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs text-slate-400 w-24 shrink-0">{label}</span>
-      <div className="flex-1 bg-slate-700 rounded h-2 overflow-hidden">
-        <div className={`h-2 rounded transition-all ${isPos ? "bg-emerald-500" : "bg-red-500"}`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className={`text-xs w-10 text-right font-mono ${isPos ? "text-emerald-400" : "text-red-400"}`}>
-        {value >= 0 ? "+" : ""}{value.toFixed(2)}
-      </span>
-    </div>
-  );
-}
-
-// ── Indicator row ──────────────────────────────────────────────────────────
-function IndicatorRow({ label, value, badge }: { label: string; value: string; badge?: { text: string; cls: string } }) {
-  return (
-    <div className="flex items-center justify-between py-0.5">
-      <span className="text-slate-400 text-xs">{label}</span>
-      <div className="flex items-center gap-2">
-        <span className="text-slate-200 text-xs font-mono">{value}</span>
-        {badge && <span className={`text-xs ${badge.cls}`}>{badge.text}</span>}
-      </div>
-    </div>
-  );
-}
-
-// ── Watchlist panel ────────────────────────────────────────────────────────
-function WatchlistPanel({
-  onSelect,
-  onItemsChange,
-}: {
-  onSelect: (symbol: string) => void;
-  onItemsChange?: (items: WatchlistItem[]) => void;
-}) {
-  const [items, setItems] = useState<WatchlistItem[]>([]);
-  const [input, setInput] = useState("");
-  const [intervalHour, setIntervalHour] = useState(4);
-  const [notifyMode, setNotifyMode] = useState<"event" | "interval">("event");
-  const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<SymbolSearchResult[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [draggingSymbol, setDraggingSymbol] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const data = await fetchJSON<WatchlistItem[]>("/api/watchlist");
-      const next = data ?? [];
-      setItems(next);
-      onItemsChange?.(next);
-    } catch { /* ignore */ }
-  }, [onItemsChange]);
-
-  useEffect(() => { load(); }, [load]);
-
-  useEffect(() => {
-    if (input.trim().length < 2) {
-      setResults([]);
-      return;
-    }
-    const t = setTimeout(async () => {
-      setSearching(true);
-      try {
-        const data = await fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(input.trim())}&limit=8`);
-        setResults(data ?? []);
-      } catch {
-        setResults([]);
-      } finally {
-        setSearching(false);
-      }
-    }, 250);
-
-    return () => clearTimeout(t);
-  }, [input]);
-
-  const add = async () => {
-    const sym = input.trim().toUpperCase();
-    if (!sym) return;
-    setSaving(true);
-    try {
-      await fetch(
-        `${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${intervalHour}&notify_mode=${notifyMode}`,
-        { method: "POST" },
-      );
-      setInput("");
-      setResults([]);
-      await load();
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const remove = async (sym: string) => {
-    await fetch(`${API_BASE}/api/watchlist?symbol=${sym}`, { method: "DELETE" });
-    await load();
-  };
-
-  const updateInterval = async (sym: string, nextHour: number) => {
-    const item = items.find((x) => x.symbol === sym);
-    const mode = item?.notify_mode === "interval" ? "interval" : "event";
-    await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${nextHour}&notify_mode=${mode}`, { method: "POST" });
-    await load();
-  };
-
-  const updateMode = async (sym: string, nextMode: "event" | "interval") => {
-    const item = items.find((x) => x.symbol === sym);
-    const nextHour = item?.notify_interval_hour ?? 4;
-    await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${nextHour}&notify_mode=${nextMode}`, { method: "POST" });
-    await load();
-  };
-
-  const togglePin = async (item: WatchlistItem) => {
-    const nextPinned = !(item.pinned ?? false);
-    await fetch(`${API_BASE}/api/watchlist/pin?symbol=${item.symbol}&pinned=${nextPinned}`, { method: "POST" });
-    await load();
-  };
-
-  const reorder = async (fromSym: string, toSym: string) => {
-    if (!fromSym || !toSym || fromSym === toSym) return;
-
-    const fromIdx = items.findIndex((x) => x.symbol === fromSym);
-    const toIdx = items.findIndex((x) => x.symbol === toSym);
-    if (fromIdx < 0 || toIdx < 0) return;
-
-    const next = [...items];
-    const [moved] = next.splice(fromIdx, 1);
-    next.splice(toIdx, 0, moved);
-
-    setItems(next);
-    onItemsChange?.(next);
-
-    const symbols = next.map((x) => x.symbol);
-    const res = await fetch(`${API_BASE}/api/watchlist/reorder`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ symbols }),
-    });
-    if (!res.ok) {
-      await load();
-    }
-  };
-
-  return (
-    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-      <h3 className="text-sm font-semibold text-slate-300 mb-1">Watchlist</h3>
-      <p className="text-[11px] text-slate-500 mb-3">E: Event-triggered alerts · I: Interval alerts</p>
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && add()}
-          placeholder="Add symbol or name..."
-          className="flex-1 px-2 py-1.5 bg-slate-700 border border-slate-600 text-white text-xs rounded focus:outline-none focus:border-indigo-500"
-        />
-        {notifyMode === "interval" && (
-          <select
-            value={intervalHour}
-            onChange={(e) => setIntervalHour(Number(e.target.value))}
-            className="px-2 py-1.5 bg-slate-700 border border-slate-600 text-white text-xs rounded focus:outline-none focus:border-indigo-500"
-          >
-            <option value={1}>1h</option>
-            <option value={2}>2h</option>
-            <option value={4}>4h</option>
-            <option value={6}>6h</option>
-            <option value={12}>12h</option>
-          </select>
-        )}
-        <div className="inline-flex rounded border border-slate-600 overflow-hidden">
-          <button
-            onClick={() => setNotifyMode("event")}
-            className={`px-2 py-1.5 text-[11px] transition-colors ${
-              notifyMode === "event" ? "bg-cyan-500/20 text-cyan-200" : "bg-slate-700 text-slate-400"
-            }`}
-          >
-            Event
-          </button>
-          <button
-            onClick={() => setNotifyMode("interval")}
-            className={`px-2 py-1.5 text-[11px] transition-colors border-l border-slate-600 ${
-              notifyMode === "interval" ? "bg-amber-500/20 text-amber-200" : "bg-slate-700 text-slate-400"
-            }`}
-          >
-            Interval
-          </button>
-        </div>
-        <button
-          onClick={add}
-          disabled={saving}
-          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded transition-colors disabled:opacity-50"
-        >
-          Add
-        </button>
-      </div>
-      {searching && <p className="text-[11px] text-slate-500 mb-2">Searching symbols...</p>}
-      {results.length > 0 && (
-        <div className="mb-3 max-h-36 overflow-auto border border-slate-700 rounded-lg">
-          {results.map((row) => (
-            <button
-              key={`${row.symbol}-${row.exchange}`}
-              onClick={() => setInput(row.symbol)}
-              className="w-full text-left px-2 py-1.5 hover:bg-slate-700/60 transition-colors border-b border-slate-800 last:border-b-0"
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono text-indigo-300">{row.symbol}</span>
-                <span className="text-[10px] text-slate-500">{row.exchange}</span>
-              </div>
-              <p className="text-[11px] text-slate-400 truncate">{row.name || "(no name)"}</p>
-              <div className="mt-1 flex items-center gap-1.5">
-                <span className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
-                  Country {inferCountryFromExchange(row.exchange)}
-                </span>
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border ${typeBadgeClass(normalizeTypeLabel(row.type_display))}`}>
-                  {normalizeTypeLabel(row.type_display)}
-                </span>
-              </div>
-            </button>
-          ))}
-        </div>
-      )}
-      {items.length === 0 ? (
-        <p className="text-xs text-slate-500 text-center py-2">No symbols saved</p>
-      ) : (
-        <div className="space-y-1">
-          {items.map((item) => (
-            <div
-              key={item.symbol}
-              draggable
-              onDragStart={() => setDraggingSymbol(item.symbol)}
-              onDragEnd={() => setDraggingSymbol(null)}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={async () => {
-                const from = draggingSymbol;
-                setDraggingSymbol(null);
-                if (from) await reorder(from, item.symbol);
-              }}
-              className={`flex items-center justify-between group rounded px-1 ${draggingSymbol === item.symbol ? "opacity-50" : ""}`}
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-slate-500 cursor-grab select-none" title="Drag to reorder">⋮⋮</span>
-                <button
-                  onClick={() => togglePin(item)}
-                  className={`text-xs transition-colors ${item.pinned ? "text-amber-300" : "text-slate-500 hover:text-amber-300"}`}
-                  title={item.pinned ? "Unpin" : "Pin"}
-                >
-                  {item.pinned ? "★" : "☆"}
-                </button>
-                <button
-                  onClick={() => onSelect(item.symbol)}
-                  className="text-sm font-mono text-indigo-400 hover:text-indigo-300 transition-colors"
-                >
-                  {item.symbol}
-                </button>
-                <div className="inline-flex rounded border border-slate-600 overflow-hidden">
-                  <button
-                    onClick={() => updateMode(item.symbol, "event")}
-                    className={`px-1.5 py-0.5 text-[10px] transition-colors ${
-                      (item.notify_mode ?? "event") === "event" ? "bg-cyan-500/20 text-cyan-200" : "bg-slate-700 text-slate-400"
-                    }`}
-                    title="Alert only on meaningful changes"
-                  >
-                    E
-                  </button>
-                  <button
-                    onClick={() => updateMode(item.symbol, "interval")}
-                    className={`px-1.5 py-0.5 text-[10px] transition-colors border-l border-slate-600 ${
-                      item.notify_mode === "interval" ? "bg-amber-500/20 text-amber-200" : "bg-slate-700 text-slate-400"
-                    }`}
-                    title="Force alert on interval"
-                  >
-                    I
-                  </button>
-                </div>
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border ${item.notify_mode === "interval" ? "border-amber-500/40 text-amber-300" : "border-cyan-500/40 text-cyan-300"}`}>
-                  {notifyModeLabel(item.notify_mode)}
-                </span>
-                {item.notify_mode === "interval" && (
-                  <select
-                    value={item.notify_interval_hour ?? 4}
-                    onChange={(e) => updateInterval(item.symbol, Number(e.target.value))}
-                    className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-300"
-                  >
-                    <option value={1}>1h</option>
-                    <option value={2}>2h</option>
-                    <option value={4}>4h</option>
-                    <option value={6}>6h</option>
-                    <option value={12}>12h</option>
-                  </select>
-                )}
-              </div>
-              <button
-                onClick={() => remove(item.symbol)}
-                className="text-xs text-slate-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── DB storage monitor panel ───────────────────────────────────────────────
-function DBStatsPanel() {
-  const [stats, setStats] = useState<DBStats | null>(null);
-  const [pruning, setPruning] = useState(false);
-  const [msg, setMsg] = useState("");
-
-  const load = async () => {
-    try {
-      const s = await fetchJSON<DBStats>("/api/db/stats");
-      setStats(s);
-    } catch { /* ignore */ }
-  };
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 60_000);
-    return () => clearInterval(t);
-  }, []);
-
-  const prune = async () => {
-    setPruning(true);
-    setMsg("");
-    try {
-      const r = await fetch(`${API_BASE}/api/db/prune?keep_days=365`, { method: "POST" });
-      const d = await r.json();
-      setMsg(`Deleted ${d.deleted} records`);
-      await load();
-    } catch {
-      setMsg("Error occurred");
-    } finally {
-      setPruning(false);
-    }
-  };
-
-  if (!stats) return null;
-
-  const usedPct = Math.min(100, (stats.storage_size_mb / 500) * 100);
-
-  return (
-    <div className={`rounded-xl border p-4 ${stats.over_limit ? "border-red-500/60 bg-red-500/10" : "border-slate-700 bg-slate-800/50"}`}>
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-slate-300">DB Storage</h3>
-        {stats.over_limit && (
-          <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full animate-pulse">⚠ Near Limit</span>
-        )}
-      </div>
-      <div className="w-full bg-slate-700 rounded-full h-2 mb-2">
-        <div
-          className={`h-2 rounded-full transition-all ${usedPct > 90 ? "bg-red-500" : usedPct > 70 ? "bg-yellow-500" : "bg-emerald-500"}`}
-          style={{ width: `${usedPct}%` }}
-        />
-      </div>
-      <div className="flex justify-between text-xs text-slate-400 mb-3">
-        <span>{stats.storage_size_mb.toFixed(1)} MB used</span>
-        <span>500 MB limit</span>
-      </div>
-      <div className="grid grid-cols-2 gap-2 text-xs text-slate-400 mb-3">
-        <span>Data: {stats.data_size_mb.toFixed(2)} MB</span>
-        <span>Docs: {stats.objects.toLocaleString()}</span>
-      </div>
-      <button
-        onClick={prune}
-        disabled={pruning}
-        className="w-full text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 py-1.5 rounded transition-colors disabled:opacity-50"
-      >
-        {pruning ? "Pruning..." : "Prune data older than 1 year"}
-      </button>
-      {msg && <p className="text-xs text-center mt-2 text-emerald-400">{msg}</p>}
-    </div>
-  );
-}
-
-function SourceStatusPanel() {
-  const [rows, setRows] = useState<SourceStatus[]>([]);
-
-  const load = async () => {
-    try {
-      const data = await fetchJSON<SourceStatus[]>("/api/sources/status");
-      setRows(data ?? []);
-    } catch {
-      setRows([]);
-    }
-  };
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 60_000);
-    return () => clearInterval(t);
-  }, []);
-
-  const badgeClass = (r: SourceStatus) => {
-    if (r.ok) return "bg-emerald-500/20 border-emerald-500/40 text-emerald-300";
-    if ((r.error ?? "").includes("403")) return "bg-yellow-500/20 border-yellow-500/40 text-yellow-300";
-    return "bg-red-500/20 border-red-500/40 text-red-300";
-  };
-
-  return (
-    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-      <h3 className="text-sm font-semibold text-slate-300 mb-3">Data Source Status</h3>
-      {rows.length === 0 ? (
-        <p className="text-xs text-slate-500">No status data</p>
-      ) : (
-        <div className="space-y-2">
-          {rows.map((r) => (
-            <div key={r.source} className="rounded-lg border border-slate-700 p-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono text-slate-200">{r.source}</span>
-                <span className={`text-[10px] px-2 py-0.5 rounded border ${badgeClass(r)}`}>
-                  {r.ok ? "OK" : "ISSUE"}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-500 mt-1">{r.detail} • {r.latency_ms}ms</p>
-              {r.error && <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{r.error}</p>}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Hourly7DayPanel({ symbol, candles }: { symbol: string; candles: CandleDoc[] }) {
-  const latest = candles[candles.length - 1];
-  const base24h = candles.length > 24 ? candles[candles.length - 25] : undefined;
-  const currentPrice = latest?.close ?? 0;
-  const change24hPct = base24h && base24h.close > 0 ? ((currentPrice - base24h.close) / base24h.close) * 100 : 0;
-
-  const last24 = candles.slice(-24).reverse();
-
-  return (
-    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h2 className="font-semibold text-slate-200">{symbol} 7D Hourly Movement</h2>
-        <span className="text-[11px] text-slate-500">Last 7 days · 1H candles</span>
-      </div>
-
-      {candles.length === 0 ? (
-        <p className="text-xs text-slate-500">No hourly data</p>
-      ) : (
-        <>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
-            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
-              <p className="text-[11px] text-slate-500 mb-1">Current Price</p>
-              <p className="text-xl font-black text-white">{formatPrice(currentPrice)}</p>
-              <p className="text-[11px] text-slate-500 mt-1">{latest?.timestamp ? new Date(latest.timestamp).toLocaleString() : "-"}</p>
-            </div>
-            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
-              <p className="text-[11px] text-slate-500 mb-1">24H Change</p>
-              <p className={`text-xl font-black ${change24hPct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(change24hPct)}</p>
-              <p className="text-[11px] text-slate-500 mt-1">vs 24 hours ago</p>
-            </div>
-            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
-              <p className="text-[11px] text-slate-500 mb-1">7D Range</p>
-              <p className="text-sm font-semibold text-slate-200">
-                {formatPrice(Math.min(...candles.map((x) => x.close)))} ~ {formatPrice(Math.max(...candles.map((x) => x.close)))}
-              </p>
-              <p className="text-[11px] text-slate-500 mt-1">high / low</p>
-            </div>
-          </div>
-
-          <div className="rounded-lg border border-slate-700 overflow-hidden">
-            <div className="max-h-48 overflow-auto">
-              <table className="w-full text-xs">
-                <thead className="bg-slate-900/60 text-slate-400 sticky top-0">
-                  <tr>
-                    <th className="text-left px-2 py-1.5 font-medium">Hour</th>
-                    <th className="text-right px-2 py-1.5 font-medium">Price</th>
-                    <th className="text-right px-2 py-1.5 font-medium">Change</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {last24.map((row, idx) => {
-                    const prev = idx < last24.length - 1 ? last24[idx + 1] : undefined;
-                    const pct = prev && prev.close > 0 ? ((row.close - prev.close) / prev.close) * 100 : 0;
-                    return (
-                      <tr key={`${row.timestamp}-${idx}`} className="border-t border-slate-800">
-                        <td className="px-2 py-1.5 text-slate-300">{new Date(row.timestamp).toLocaleString()}</td>
-                        <td className="px-2 py-1.5 text-right text-slate-200 font-mono">{formatPrice(row.close)}</td>
-                        <td className={`px-2 py-1.5 text-right font-mono ${pct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(pct)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function DailyClose30Panel({ symbol, candles }: { symbol: string; candles: CandleDoc[] }) {
-  const last30 = candles.slice(-30).reverse();
-
-  return (
-    <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h2 className="font-semibold text-slate-200">{symbol} Daily Close (30D)</h2>
-        <span className="text-[11px] text-slate-500">Last 30 daily closes</span>
-      </div>
-
-      {last30.length === 0 ? (
-        <p className="text-xs text-slate-500">No daily close data</p>
-      ) : (
-        <div className="rounded-lg border border-slate-700 overflow-hidden">
-          <div className="max-h-64 overflow-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-slate-900/60 text-slate-400 sticky top-0">
-                <tr>
-                  <th className="text-left px-2 py-1.5 font-medium">Date</th>
-                  <th className="text-right px-2 py-1.5 font-medium">Close</th>
-                  <th className="text-right px-2 py-1.5 font-medium">D-1 Change</th>
-                </tr>
-              </thead>
-              <tbody>
-                {last30.map((row, idx) => {
-                  const prev = idx < last30.length - 1 ? last30[idx + 1] : undefined;
-                  const pct = prev && prev.close > 0 ? ((row.close - prev.close) / prev.close) * 100 : 0;
-                  return (
-                    <tr key={`${row.timestamp}-${idx}`} className="border-t border-slate-800">
-                      <td className="px-2 py-1.5 text-slate-300">{new Date(row.timestamp).toLocaleDateString()}</td>
-                      <td className="px-2 py-1.5 text-right text-slate-200 font-mono">{formatPrice(row.close)}</td>
-                      <td className={`px-2 py-1.5 text-right font-mono ${pct >= 0 ? "text-emerald-300" : "text-red-300"}`}>{formatPct(pct)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ── Main dashboard ─────────────────────────────────────────────────────────
 export default function Dashboard() {
   const [symbol, setSymbol] = useState("NVDA");
   const [inputSymbol, setInputSymbol] = useState("NVDA");
-  const [timingTF, setTimingTF] = useState("120");
   const [watchlistItems, setWatchlistItems] = useState<WatchlistItem[]>([]);
   const [candles, setCandles] = useState<CandleDoc[]>([]);
   const [hourlyCandles, setHourlyCandles] = useState<CandleDoc[]>([]);
@@ -838,7 +57,7 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [lastUpdate, setLastUpdate] = useState("");
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
-  const [autoRefreshSec, setAutoRefreshSec] = useState(30);
+  const [autoRefreshSec, setAutoRefreshSec] = useState(60);
   const [prefsReady, setPrefsReady] = useState(false);
   const [defaultSymbolSeeded, setDefaultSymbolSeeded] = useState(false);
 
@@ -850,11 +69,64 @@ export default function Dashboard() {
   const [batchAnalyzing, setBatchAnalyzing] = useState(false);
   const [batchMsg, setBatchMsg] = useState("");
 
-  const [customUniverseSymbols, setCustomUniverseSymbols] = useState<string[]>([]);
-  const [excludedUniverseSymbols, setExcludedUniverseSymbols] = useState<string[]>([]);
-  const [listInputSymbol, setListInputSymbol] = useState("");
+  const [universeSymbols, setUniverseSymbols] = useState<UniverseSymbol[]>([]);
+  const [viewHistory, setViewHistory] = useState<string[]>([]);
+  const [historyBusy, setHistoryBusy] = useState<string | null>(null);
+  const [pendingIntervalBySymbol, setPendingIntervalBySymbol] = useState<Record<string, number>>({});
   const [listSearchResults, setListSearchResults] = useState<SymbolSearchResult[]>([]);
   const [listSearching, setListSearching] = useState(false);
+
+  const loadUniverse = useCallback(async () => {
+    try {
+      const rows = await fetchJSON<UniverseSymbol[]>("/api/universe");
+      setUniverseSymbols(rows ?? []);
+    } catch {
+      setUniverseSymbols([]);
+    }
+  }, []);
+
+  const loadViewHistory = useCallback(async () => {
+    try {
+      const rows = await fetchJSON<ViewHistoryRow[]>("/api/view-history?limit=20");
+      setViewHistory((rows ?? []).map((x) => String(x.symbol).toUpperCase()));
+    } catch {
+      setViewHistory([]);
+    }
+  }, []);
+
+  const touchViewHistory = useCallback(async (sym: string) => {
+    const normalized = sym.trim().toUpperCase();
+    if (!normalized) return;
+    setViewHistory((prev) => [normalized, ...prev.filter((x) => x !== normalized)].slice(0, 20));
+    try {
+      await fetch(`${API_BASE}/api/view-history?symbol=${normalized}`, { method: "POST" });
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const removeViewHistorySymbol = useCallback(async (sym: string) => {
+    const normalized = sym.trim().toUpperCase();
+    if (!normalized || historyBusy === normalized) {
+      return;
+    }
+
+    const prev = viewHistory;
+    setHistoryBusy(normalized);
+    setViewHistory((rows) => rows.filter((x) => x !== normalized));
+
+    try {
+      const res = await fetch(`${API_BASE}/api/view-history?symbol=${normalized}`, { method: "DELETE" });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "unknown error");
+      }
+    } catch {
+      setViewHistory(prev);
+    } finally {
+      setHistoryBusy(null);
+    }
+  }, [historyBusy, viewHistory]);
 
   const loadWatchlist = async () => {
     try {
@@ -878,7 +150,7 @@ export default function Dashboard() {
         fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=1d&limit=300`),
         fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=60&limit=168`),
         fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=1d&limit=30`),
-        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${timingTF}`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}`),
       ]);
       setCandles(c);
       setHourlyCandles(h7);
@@ -899,12 +171,11 @@ export default function Dashboard() {
     if (!target) return;
     setInputSymbol(target);
     setNotifyMsg("");
-
+    touchViewHistory(target);
     if (target === symbol) {
       loadData(target);
       return;
     }
-
     setSymbol(target);
   };
 
@@ -912,7 +183,7 @@ export default function Dashboard() {
     setNotifying(true);
     setNotifyMsg("");
     try {
-      const res = await fetch(`${API_BASE}/api/notify?symbol=${symbol}&timing_tf=${timingTF}`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/api/notify?symbol=${symbol}`, { method: "POST" });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error ?? "unknown error");
       setNotifyMsg(`Sent [${d.symbol}] ${d.action} to Telegram`);
@@ -924,11 +195,7 @@ export default function Dashboard() {
   };
 
   const buildManagedSymbols = () => {
-    const watchlistSymbols = watchlistItems.map((x) => x.symbol.toUpperCase());
-    const base = MARKET_CAP_BASE_SYMBOLS.filter((sym) => !excludedUniverseSymbols.includes(sym));
-    const custom = customUniverseSymbols.filter((sym) => !excludedUniverseSymbols.includes(sym));
-    const extraWatchlist = watchlistSymbols.filter((sym) => !base.includes(sym) && !custom.includes(sym));
-    return Array.from(new Set([...base, ...custom, ...extraWatchlist]));
+    return Array.from(new Set(universeSymbols.map((x) => String(x.symbol).toUpperCase())));
   };
 
   const loadUniverseScan = async () => {
@@ -936,12 +203,50 @@ export default function Dashboard() {
     setScanError("");
     try {
       const symbols = buildManagedSymbols();
+      if (symbols.length === 0) {
+        setScanRows([]);
+        setScanUpdatedAt(new Date().toLocaleTimeString("en-US", { hour12: false }));
+        return;
+      }
+
+      const batchRes = await fetch(`${API_BASE}/api/signals/batch?timing_tf=${SCAN_TF}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols }),
+      });
+      if (!batchRes.ok) {
+        const d = await batchRes.json().catch(() => ({}));
+        throw new Error(d.error ?? `batch signals -> ${batchRes.status}`);
+      }
+      const batchRows = (await batchRes.json()) as Array<Signal & { error?: string }>;
+      const signalBySymbol = new Map<string, Signal>();
+      for (const row of batchRows) {
+        if (row && !row.error && row.symbol) {
+          signalBySymbol.set(String(row.symbol).toUpperCase(), row);
+        }
+      }
+
+      const metaCache = new Map(
+        scanRows.map((r) => [r.symbol.toUpperCase(), { companyName: r.companyName, exchange: r.exchange, typeLabel: r.typeLabel }]),
+      );
       const settled = await Promise.allSettled(
         symbols.map(async (sym) => {
-          const [data, searchRows] = await Promise.all([
-            fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${SCAN_TF}`),
-            fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(sym)}&limit=5`).catch(() => [] as SymbolSearchResult[]),
-          ]);
+          const data = signalBySymbol.get(sym);
+          if (!data) {
+            throw new Error(`missing batch signal: ${sym}`);
+          }
+          const cached = metaCache.get(sym);
+          if (cached && (cached.companyName || cached.exchange || cached.typeLabel)) {
+            return {
+              symbol: sym,
+              signal: data,
+              companyName: cached.companyName,
+              exchange: cached.exchange,
+              typeLabel: cached.typeLabel,
+            };
+          }
+
+          const searchRows = await fetchJSON<SymbolSearchResult[]>(`/api/symbols/search?q=${encodeURIComponent(sym)}&limit=5`).catch(() => [] as SymbolSearchResult[]);
           const exact = (searchRows ?? []).find((x) => x.symbol.toUpperCase() === sym);
           const fallback = (searchRows ?? [])[0];
           const picked = exact ?? fallback;
@@ -958,7 +263,13 @@ export default function Dashboard() {
       const rows: ScanRow[] = settled
         .filter((r): r is PromiseFulfilledResult<ScanRow> => r.status === "fulfilled")
         .map((r) => r.value)
-        .sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
+        .sort((a, b) => {
+          const scoreGap = topListScore(b) - topListScore(a);
+          if (scoreGap !== 0) return scoreGap;
+          const buyGap = b.signal.buy_pct - a.signal.buy_pct;
+          if (buyGap !== 0) return buyGap;
+          return a.symbol.localeCompare(b.symbol);
+        });
 
       setScanRows(rows);
       setScanUpdatedAt(new Date().toLocaleTimeString("en-US", { hour12: false }));
@@ -970,11 +281,11 @@ export default function Dashboard() {
     }
   };
 
-  const addAlertTarget = async (sym: string, mode: "event" | "interval") => {
+  const addAlertTarget = async (sym: string, mode: "event" | "interval", selectedMinute?: number) => {
     setScanActionBusy(`${sym}:${mode}:add`);
     try {
-      const hour = 4;
-      const res = await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_hours=${hour}&notify_mode=${mode}`, {
+      const minute = mode === "interval" ? (selectedMinute ?? 5) : 5;
+      const res = await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_minutes=${minute}&notify_mode=${mode}`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -1005,18 +316,6 @@ export default function Dashboard() {
     } finally {
       setScanActionBusy(null);
     }
-  };
-
-  const registerAllVisible = async (mode: "event" | "interval") => {
-    setBatchAnalyzing(true);
-    setBatchMsg("");
-    let ok = 0;
-    for (const row of scanRows) {
-      const success = await addAlertTarget(row.symbol, mode);
-      if (success) ok += 1;
-    }
-    setBatchMsg(`Bulk add complete: ${ok}/${scanRows.length} (${mode.toUpperCase()})`);
-    setBatchAnalyzing(false);
   };
 
   const analyzeAllAlertTargets = async () => {
@@ -1057,23 +356,24 @@ export default function Dashboard() {
     await loadUniverseScan();
   };
 
-  const commitUniverseSymbol = (sym: string) => {
+  const commitUniverseSymbol = async (sym: string) => {
     const normalized = sym.trim().toUpperCase();
-    if (!normalized) return;
-
-    const nextCustom = customUniverseSymbols.includes(normalized) || MARKET_CAP_BASE_SYMBOLS.includes(normalized)
-      ? customUniverseSymbols
-      : [...customUniverseSymbols, normalized];
-    setCustomUniverseSymbols(nextCustom);
-    localStorage.setItem(CUSTOM_UNIVERSE_STORAGE_KEY, JSON.stringify(nextCustom));
-
-    const nextExcluded = excludedUniverseSymbols.filter((x) => x !== normalized);
-    setExcludedUniverseSymbols(nextExcluded);
-    localStorage.setItem(EXCLUDED_UNIVERSE_STORAGE_KEY, JSON.stringify(nextExcluded));
+    if (!normalized || universeSymbols.some((x) => x.symbol === normalized)) {
+      return;
+    }
+    const kind = MARKET_CAP_BASE_SYMBOLS.includes(normalized) ? "base" : "custom";
+    const res = await fetch(`${API_BASE}/api/universe?symbol=${normalized}&kind=${kind}`, { method: "POST" });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      setBatchMsg(`Failed to add symbol: ${d.error ?? "unknown error"}`);
+      return;
+    }
+    await loadUniverse();
+    setBatchMsg(`Added to managed list: ${normalized}`);
   };
 
   const addUniverseSymbol = async () => {
-    const query = listInputSymbol.trim();
+    const query = inputSymbol.trim();
     const sym = query.toUpperCase();
     if (!sym) return;
 
@@ -1084,18 +384,15 @@ export default function Dashboard() {
 
       const exact = (results ?? []).find((r) => r.symbol.toUpperCase() === sym);
       if (exact) {
-        commitUniverseSymbol(exact.symbol);
-        setBatchMsg(`Added: ${exact.symbol} (${exact.name || exact.type_display || ""})`);
-        setListInputSymbol("");
+        await commitUniverseSymbol(exact.symbol);
+        setInputSymbol(exact.symbol.toUpperCase());
         setListSearchResults([]);
         return;
       }
 
       if ((results ?? []).length > 0) {
-        const first = results[0];
-        commitUniverseSymbol(first.symbol);
-        setBatchMsg(`Added ${first.symbol} (${first.name || first.type_display || ""}) from results for '${query}'.`);
-        setListInputSymbol("");
+        await commitUniverseSymbol(results[0].symbol);
+        setInputSymbol(results[0].symbol.toUpperCase());
         setListSearchResults([]);
         return;
       }
@@ -1109,18 +406,35 @@ export default function Dashboard() {
   };
 
   const removeUniverseSymbol = async (sym: string) => {
-    if (MARKET_CAP_BASE_SYMBOLS.includes(sym)) {
-      const nextExcluded = excludedUniverseSymbols.includes(sym) ? excludedUniverseSymbols : [...excludedUniverseSymbols, sym];
-      setExcludedUniverseSymbols(nextExcluded);
-      localStorage.setItem(EXCLUDED_UNIVERSE_STORAGE_KEY, JSON.stringify(nextExcluded));
-    } else {
-      const nextCustom = customUniverseSymbols.filter((x) => x !== sym);
-      setCustomUniverseSymbols(nextCustom);
-      localStorage.setItem(CUSTOM_UNIVERSE_STORAGE_KEY, JSON.stringify(nextCustom));
+    if (scanActionBusy === `${sym}:delete`) {
+      return;
     }
 
-    if (watchlistItems.some((x) => x.symbol === sym)) {
-      await removeAlertTarget(sym);
+    const prevScanRows = scanRows;
+    const prevUniverse = universeSymbols;
+    const prevWatchlist = watchlistItems;
+
+    setScanActionBusy(`${sym}:delete`);
+    setScanRows((prev) => prev.filter((row) => row.symbol !== sym));
+    setUniverseSymbols((prev) => prev.filter((row) => row.symbol !== sym));
+    setWatchlistItems((prev) => prev.filter((row) => row.symbol !== sym));
+    setBatchMsg(`${sym} removed locally. Syncing DB...`);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/universe?symbol=${sym}`, { method: "DELETE" });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "unknown error");
+      }
+      setBatchMsg(`${sym} deleted from DB managed list.`);
+      void Promise.all([loadUniverse(), loadWatchlist(), loadUniverseScan()]);
+    } catch (e) {
+      setScanRows(prevScanRows);
+      setUniverseSymbols(prevUniverse);
+      setWatchlistItems(prevWatchlist);
+      setBatchMsg(`Failed to delete ${sym}: ${String(e)}`);
+    } finally {
+      setScanActionBusy(null);
     }
   };
 
@@ -1129,46 +443,38 @@ export default function Dashboard() {
       return;
     }
     loadData(symbol);
-  }, [prefsReady, symbol, timingTF]); // eslint-disable-line react-hooks/exhaustive-deps
+    touchViewHistory(symbol);
+  }, [prefsReady, symbol]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!prefsReady || !autoRefreshEnabled) {
       return;
     }
-
     const t = setInterval(() => {
       loadData(symbol, { silent: true });
     }, autoRefreshSec * 1000);
     return () => clearInterval(t);
-  }, [symbol, timingTF, autoRefreshEnabled, autoRefreshSec, prefsReady]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, autoRefreshEnabled, autoRefreshSec, prefsReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!prefsReady) {
       return;
     }
-
     localStorage.setItem(
       DASHBOARD_PREFS_STORAGE_KEY,
-      JSON.stringify({
-        symbol,
-        timingTF,
-        autoRefreshEnabled,
-        autoRefreshSec,
-      }),
+      JSON.stringify({ symbol, autoRefreshEnabled, autoRefreshSec }),
     );
-  }, [prefsReady, symbol, timingTF, autoRefreshEnabled, autoRefreshSec]);
+  }, [prefsReady, symbol, autoRefreshEnabled, autoRefreshSec]);
 
   useEffect(() => {
     if (!prefsReady || defaultSymbolSeeded) {
       return;
     }
-
     const rawDashboardPrefs = localStorage.getItem(DASHBOARD_PREFS_STORAGE_KEY);
     if (rawDashboardPrefs) {
       setDefaultSymbolSeeded(true);
       return;
     }
-
     if (watchlistItems.length > 0) {
       const first = String(watchlistItems[0].symbol ?? "").trim().toUpperCase();
       if (first) {
@@ -1181,42 +487,26 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadWatchlist();
-    const rawCustom = localStorage.getItem(CUSTOM_UNIVERSE_STORAGE_KEY);
-    const rawExcluded = localStorage.getItem(EXCLUDED_UNIVERSE_STORAGE_KEY);
+    loadUniverse();
+    loadViewHistory();
+
     const rawDashboardPrefs = localStorage.getItem(DASHBOARD_PREFS_STORAGE_KEY);
     try {
-      if (rawCustom) {
-        const parsed = JSON.parse(rawCustom);
-        if (Array.isArray(parsed)) setCustomUniverseSymbols(parsed.map((x) => String(x).toUpperCase()));
-      }
-      if (rawExcluded) {
-        const parsed = JSON.parse(rawExcluded);
-        if (Array.isArray(parsed)) setExcludedUniverseSymbols(parsed.map((x) => String(x).toUpperCase()));
-      }
-
       if (rawDashboardPrefs) {
         const parsed = JSON.parse(rawDashboardPrefs) as {
           symbol?: string;
-          timingTF?: string;
           autoRefreshEnabled?: boolean;
           autoRefreshSec?: number;
         };
-
         const savedSymbol = String(parsed.symbol ?? "").trim().toUpperCase();
         if (savedSymbol) {
           setSymbol(savedSymbol);
           setInputSymbol(savedSymbol);
         }
-
-        if (parsed.timingTF && ["60", "120", "240"].includes(parsed.timingTF)) {
-          setTimingTF(parsed.timingTF);
-        }
-
         if (typeof parsed.autoRefreshEnabled === "boolean") {
           setAutoRefreshEnabled(parsed.autoRefreshEnabled);
         }
-
-        if ([10, 30, 60].includes(Number(parsed.autoRefreshSec))) {
+        if ([60, 120, 300].includes(Number(parsed.autoRefreshSec))) {
           setAutoRefreshSec(Number(parsed.autoRefreshSec));
         }
       }
@@ -1225,21 +515,20 @@ export default function Dashboard() {
     } finally {
       setPrefsReady(true);
     }
-  }, []);
+  }, [loadUniverse, loadViewHistory]);
 
   useEffect(() => {
     loadUniverseScan();
     const t = setInterval(loadUniverseScan, 180_000);
     return () => clearInterval(t);
-  }, [watchlistItems, customUniverseSymbols, excludedUniverseSymbols]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [universeSymbols]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    const q = listInputSymbol.trim();
+    const q = inputSymbol.trim();
     if (q.length < 2) {
       setListSearchResults([]);
       return;
     }
-
     const t = setTimeout(async () => {
       try {
         setListSearching(true);
@@ -1251,13 +540,84 @@ export default function Dashboard() {
         setListSearching(false);
       }
     }, 250);
-
     return () => clearTimeout(t);
-  }, [listInputSymbol]);
+  }, [inputSymbol]);
 
-  const watchlistSymbols = watchlistItems.map((item) => item.symbol);
-  const hasCurrentInWatchlist = watchlistSymbols.includes(symbol);
+  const recentSymbols = viewHistory.length > 0 ? viewHistory : watchlistItems.map((x) => x.symbol).slice(0, 20);
   const currentPrice = hourlyCandles[hourlyCandles.length - 1]?.close ?? candles[candles.length - 1]?.close;
+  const managedSymbols = buildManagedSymbols();
+  const managedSet = new Set(managedSymbols);
+  const alertsOnCount = watchlistItems.filter((x) => managedSet.has(String(x.symbol).toUpperCase())).length;
+  const totalManagedCount = managedSymbols.length;
+
+  const pinnedSet = new Set(
+    watchlistItems.filter((x) => x.pinned).map((x) => String(x.symbol).toUpperCase()),
+  );
+  const sortScanRows = (a: ScanRow, b: ScanRow) => {
+    const aPinned = pinnedSet.has(a.symbol);
+    const bPinned = pinnedSet.has(b.symbol);
+    if (aPinned !== bPinned) {
+      return aPinned ? -1 : 1;
+    }
+    const scoreGap = topListScore(b) - topListScore(a);
+    if (scoreGap !== 0) return scoreGap;
+    const buyGap = b.signal.buy_pct - a.signal.buy_pct;
+    if (buyGap !== 0) return buyGap;
+    return a.symbol.localeCompare(b.symbol);
+  };
+  const scanRowsSorted = [...scanRows].sort(sortScanRows);
+  const topRow = scanRowsSorted.length === 0 ? null : scanRowsSorted[0];
+
+  const togglePinnedFromScan = async (sym: string) => {
+    const wl = watchlistItems.find((x) => x.symbol === sym);
+    const nextPinned = !(wl?.pinned ?? false);
+
+    // If the symbol is not yet an alert target, auto-register it first so
+    // favorites can be managed directly from the list.
+    if (!wl) {
+      const optimistic: WatchlistItem = {
+        symbol: sym,
+        added_at: new Date().toISOString(),
+        notify_mode: "event",
+        notify_interval_minute: 5,
+        notify_interval_hour: 1,
+        pinned: nextPinned,
+        sort_order: watchlistItems.length,
+      };
+      setWatchlistItems((prev) => [...prev, optimistic]);
+      try {
+        const addRes = await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_minutes=5&notify_mode=event`, {
+          method: "POST",
+        });
+        if (!addRes.ok) {
+          const d = await addRes.json().catch(() => ({}));
+          throw new Error(d.error ?? "failed to create watchlist target");
+        }
+
+        const pinRes = await fetch(`${API_BASE}/api/watchlist/pin?symbol=${sym}&pinned=${nextPinned}`, { method: "POST" });
+        if (!pinRes.ok) {
+          const d = await pinRes.json().catch(() => ({}));
+          throw new Error(d.error ?? "failed to pin");
+        }
+        await loadWatchlist();
+      } catch (e) {
+        setWatchlistItems((prev) => prev.filter((x) => x.symbol !== sym));
+        setBatchMsg(`Failed to set favorite: ${String(e)}`);
+      }
+      return;
+    }
+
+    setWatchlistItems((prev) => prev.map((x) => (x.symbol === sym ? { ...x, pinned: nextPinned } : x)));
+    try {
+      const res = await fetch(`${API_BASE}/api/watchlist/pin?symbol=${sym}&pinned=${nextPinned}`, { method: "POST" });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error ?? "failed to pin");
+      }
+    } catch {
+      setWatchlistItems((prev) => prev.map((x) => (x.symbol === sym ? { ...x, pinned: !nextPinned } : x)));
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#0f1117] text-slate-200 p-4 md:p-6">
@@ -1271,74 +631,27 @@ export default function Dashboard() {
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-[11px] text-slate-400">Updated</span>
             <span className="text-xs font-mono text-cyan-300">{scanUpdatedAt || "--:--:--"}</span>
-            <input
-              type="text"
-              value={listInputSymbol}
-              onChange={(e) => setListInputSymbol(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addUniverseSymbol()}
-              placeholder="Search symbol/company (e.g. NVDA, NVIDIA)"
-              className="w-28 text-xs px-2 py-1.5 rounded border border-slate-600 bg-slate-900/70 text-slate-200"
-            />
-            <button onClick={addUniverseSymbol} disabled={listSearching} className="text-xs px-3 py-1.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 transition-colors disabled:opacity-60">{listSearching ? "Validating..." : "Add to List"}</button>
             <button onClick={loadUniverseScan} disabled={scanLoading} className="text-xs px-3 py-1.5 rounded border border-cyan-400/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20 transition-colors disabled:opacity-60">{scanLoading ? "Scanning..." : "Rescan"}</button>
-            <button onClick={() => registerAllVisible("event")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 transition-colors disabled:opacity-60">Bulk Add E</button>
-            <button onClick={() => registerAllVisible("interval")} disabled={batchAnalyzing || scanRows.length === 0} className="text-xs px-3 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 transition-colors disabled:opacity-60">Bulk Add I</button>
             <button onClick={analyzeAllAlertTargets} disabled={batchAnalyzing || watchlistItems.length === 0} className="text-xs px-3 py-1.5 rounded border border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-colors disabled:opacity-60">{batchAnalyzing ? "Analyzing..." : "Analyze All Alert Targets"}</button>
           </div>
         </div>
-        {(listSearching || listSearchResults.length > 0) && (
-          <div className="mb-3 rounded-lg border border-slate-700 bg-slate-900/70 p-2">
-            {listSearching && <p className="text-[11px] text-slate-500 px-1 py-1">Searching symbols...</p>}
-            {listSearchResults.length > 0 && (
-              <div className="max-h-36 overflow-auto">
-                {listSearchResults.map((row) => (
-                  <button
-                    key={`${row.symbol}-${row.exchange}`}
-                    onClick={() => {
-                      commitUniverseSymbol(row.symbol);
-                      setBatchMsg(`Added: ${row.symbol} (${row.name || row.type_display || ""})`);
-                      setListInputSymbol("");
-                      setListSearchResults([]);
-                    }}
-                    className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-mono text-cyan-200">{row.symbol}</span>
-                      <span className="text-[10px] text-slate-500">{row.exchange}</span>
-                    </div>
-                    <p className="text-[11px] text-slate-400 truncate">{row.name || "(no name)"}</p>
-                    <div className="mt-1 flex items-center gap-1.5">
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
-                        Country {inferCountryFromExchange(row.exchange)}
-                      </span>
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${typeBadgeClass(normalizeTypeLabel(row.type_display))}`}>
-                        {normalizeTypeLabel(row.type_display)}
-                      </span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
         {batchMsg && <div className="mb-3 rounded border border-slate-700 bg-slate-900/50 px-3 py-2 text-xs text-slate-300">{batchMsg}</div>}
 
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
           <div className="xl:col-span-4 rounded-xl border border-slate-700/90 bg-[#0c1422]/80 p-4">
             <p className="text-[11px] text-slate-500 uppercase tracking-wide">Live Summary</p>
-            <p className="text-3xl font-black text-white mt-2">{scanRows.length}</p>
-            <p className="text-xs text-slate-400">managed symbols</p>
+            <p className="text-3xl font-black text-white mt-2">{alertsOnCount} / {totalManagedCount}</p>
+            <p className="text-xs text-slate-400">alerts on / total managed</p>
             <div className="mt-4 space-y-2 text-xs">
-              <div className="flex items-center justify-between"><span className="text-slate-500">Base</span><span className="font-mono text-slate-300">{MARKET_CAP_BASE_SYMBOLS.length}</span></div>
-              <div className="flex items-center justify-between"><span className="text-slate-500">Custom Added</span><span className="font-mono text-slate-300">{customUniverseSymbols.length}</span></div>
-              <div className="flex items-center justify-between"><span className="text-slate-500">Excluded</span><span className="font-mono text-slate-300">{excludedUniverseSymbols.length}</span></div>
+              <div className="flex items-center justify-between"><span className="text-slate-500">Alert Targets</span><span className="font-mono text-slate-300">{alertsOnCount}</span></div>
+              <div className="flex items-center justify-between"><span className="text-slate-500">Managed Universe</span><span className="font-mono text-slate-300">{totalManagedCount}</span></div>
             </div>
-            {scanRows[0] && (
+            {topRow && (
               <div className="mt-4 rounded-lg border border-emerald-400/30 bg-emerald-400/10 p-3">
                 <p className="text-[11px] text-emerald-300 uppercase tracking-wide">Top Of List</p>
-                <button onClick={() => handleAnalyze(scanRows[0].symbol)} className="mt-1 text-left w-full">
-                  <p className="text-lg font-black text-white">{scanRows[0].symbol}</p>
-                  <p className="text-xs text-emerald-200">Buy {scanRows[0].signal.buy_pct.toFixed(0)}%</p>
+                <button onClick={() => handleAnalyze(topRow.symbol)} className="mt-1 text-left w-full">
+                  <p className="text-lg font-black text-white">{topRow.symbol}</p>
+                  <p className="text-xs text-emerald-200">Buy {topRow.signal.buy_pct.toFixed(0)}%</p>
                 </button>
               </div>
             )}
@@ -1360,14 +673,27 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {scanRows.map((row) => {
+                  {scanRowsSorted.map((row) => {
                     const wl = watchlistItems.find((x) => x.symbol === row.symbol);
                     const isOn = Boolean(wl);
+                    const isPinned = Boolean(wl?.pinned);
                     const busy = scanActionBusy?.startsWith(`${row.symbol}:`);
                     return (
                       <tr key={row.symbol} className="border-t border-slate-800 hover:bg-cyan-500/5 transition-colors cursor-pointer" onClick={() => handleAnalyze(row.symbol)}>
                         <td className="px-3 py-2">
-                          <div className="font-mono text-white">{actionEmoji(row.signal.action)} {row.symbol}</div>
+                          <div className="font-mono text-white flex items-center gap-1.5">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                togglePinnedFromScan(row.symbol);
+                              }}
+                              className={`text-[11px] px-1.5 py-0.5 rounded border transition-colors ${isPinned ? "border-amber-500/50 text-amber-300 bg-amber-500/10" : "border-slate-600 text-slate-500 hover:text-amber-300 hover:border-amber-500/50"}`}
+                              title={isPinned ? "Favorite ON" : "Favorite OFF"}
+                            >
+                              {isPinned ? "★" : "☆"}
+                            </button>
+                            <span>{actionEmoji(row.signal.action)} {row.symbol}</span>
+                          </div>
                           <div className="mt-0.5 text-[10px] text-slate-400 truncate max-w-[220px]">{row.companyName || "No company name"}</div>
                         </td>
                         <td className={`px-3 py-2 text-right font-mono ${scanScoreClass(row.signal.buy_pct)}`}>{row.signal.buy_pct.toFixed(0)}%</td>
@@ -1377,18 +703,42 @@ export default function Dashboard() {
                         <td className={`px-3 py-2 ${actionColor(row.signal.timing_action ?? row.signal.action)}`}>{row.signal.timing_action ?? row.signal.action}</td>
                         <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
                           <div className="flex items-center gap-1.5">
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded border ${isOn ? "border-emerald-500/50 text-emerald-300" : "border-slate-600 text-slate-400"}`}>{isOn ? `ON ${notifyModeLabel(wl?.notify_mode)}` : "OFF"}</span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded border ${isOn ? "border-emerald-500/50 text-emerald-300" : "border-slate-600 text-slate-400"}`}>
+                              {isOn
+                                ? (wl?.notify_mode === "interval"
+                                  ? `ON ${notifyModeLabel(wl?.notify_mode)} ${intervalShortLabel(wl?.notify_interval_minute, wl?.notify_interval_hour)}`
+                                  : `ON ${notifyModeLabel(wl?.notify_mode)}`)
+                                : "OFF"}
+                            </span>
                             {!isOn && (
                               <>
                                 <button onClick={() => addAlertTarget(row.symbol, "event")} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-50">E+</button>
-                                <button onClick={() => addAlertTarget(row.symbol, "interval")} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50">I+</button>
+                                <select
+                                  value={pendingIntervalBySymbol[row.symbol] ?? 5}
+                                  onChange={(e) => setPendingIntervalBySymbol((prev) => ({ ...prev, [row.symbol]: Number(e.target.value) }))}
+                                  className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-200"
+                                >
+                                  <option value={5}>5m</option>
+                                  <option value={10}>10m</option>
+                                  <option value={30}>30m</option>
+                                  <option value={60}>1h</option>
+                                  <option value={240}>4h</option>
+                                  <option value={720}>12h</option>
+                                </select>
+                                <button onClick={() => addAlertTarget(row.symbol, "interval", pendingIntervalBySymbol[row.symbol] ?? 5)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50">I+</button>
                               </>
                             )}
                             {isOn && <button onClick={() => removeAlertTarget(row.symbol)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-red-500/40 text-red-200 hover:bg-red-500/20 disabled:opacity-50">Remove</button>}
                           </div>
                         </td>
                         <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                          <button onClick={() => removeUniverseSymbol(row.symbol)} className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 hover:border-red-400 hover:text-red-300">Delete</button>
+                          <button
+                            onClick={() => removeUniverseSymbol(row.symbol)}
+                            title="Delete from DB watchlist"
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 hover:border-red-400 hover:text-red-300"
+                          >
+                            Delete
+                          </button>
                         </td>
                       </tr>
                     );
@@ -1427,17 +777,13 @@ export default function Dashboard() {
             className="px-3 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg w-36 focus:outline-none focus:border-indigo-500"
           />
           <button onClick={() => handleAnalyze()} disabled={loading} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50">{loading ? "Loading..." : "Analyze"}</button>
-          <select value={timingTF} onChange={(e) => setTimingTF(e.target.value)} className="px-2 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg focus:outline-none focus:border-indigo-500">
-            <option value="60">Timing 1H</option>
-            <option value="120">Timing 2H</option>
-            <option value="240">Timing 4H</option>
-          </select>
+          <button onClick={addUniverseSymbol} disabled={listSearching} className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm rounded-lg transition-colors disabled:opacity-50">{listSearching ? "Validating..." : "Add to List"}</button>
           <div className="inline-flex items-center gap-1 rounded-lg border border-slate-600 bg-slate-800 px-2 py-1.5">
             <button
               onClick={() => setAutoRefreshEnabled((v) => !v)}
               className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${autoRefreshEnabled ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-200" : "border-slate-600 bg-slate-700 text-slate-400"}`}
             >
-              Auto {autoRefreshEnabled ? "ON" : "OFF"}
+              Auto-refresh {autoRefreshEnabled ? "ON" : "OFF"}
             </button>
             <select
               value={autoRefreshSec}
@@ -1445,32 +791,75 @@ export default function Dashboard() {
               disabled={!autoRefreshEnabled}
               className="text-[11px] px-1.5 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-200 disabled:opacity-50"
             >
-              <option value={10}>10s</option>
-              <option value={30}>30s</option>
-              <option value={60}>60s</option>
+              <option value={60}>1m</option>
+              <option value={120}>2m</option>
+              <option value={300}>5m</option>
             </select>
           </div>
-          {watchlistSymbols.length > 0 && (
-            <select value={symbol} onChange={(e) => handleAnalyze(e.target.value)} className="px-2 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg focus:outline-none focus:border-indigo-500">
-              {!hasCurrentInWatchlist && <option value={symbol}>{symbol}</option>}
-              {watchlistSymbols.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
-            </select>
-          )}
           <button onClick={handleNotify} disabled={notifying || !signal} className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm rounded-lg transition-colors disabled:opacity-50">{notifying ? "Sending..." : "Send to Telegram"}</button>
-          {lastUpdate && <span className="text-xs text-slate-500">Updated: {lastUpdate}</span>}
+          {lastUpdate && <span className="text-xs text-slate-500">Last refresh: {lastUpdate}</span>}
         </div>
       </div>
 
-      {watchlistSymbols.length > 0 && (
+      {(listSearching || listSearchResults.length > 0) && (
+        <div className="mb-4 rounded-lg border border-slate-700 bg-slate-900/70 p-2">
+          {listSearching && <p className="text-[11px] text-slate-500 px-1 py-1">Searching symbols...</p>}
+          {listSearchResults.length > 0 && (
+            <div className="max-h-36 overflow-auto">
+              {listSearchResults.map((row) => (
+                <button
+                  key={`${row.symbol}-${row.exchange}`}
+                  onClick={() => {
+                    setInputSymbol(row.symbol.toUpperCase());
+                    setListSearchResults([]);
+                  }}
+                  className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono text-cyan-200">{row.symbol}</span>
+                    <span className="text-[10px] text-slate-500">{row.exchange}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 truncate">{row.name || "(no name)"}</p>
+                  <div className="mt-1 flex items-center gap-1.5">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-800/70">
+                      Country {inferCountryFromExchange(row.exchange)}
+                    </span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border ${typeBadgeClass(normalizeTypeLabel(row.type_display))}`}>
+                      {normalizeTypeLabel(row.type_display)}
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {recentSymbols.length > 0 && (
         <div className="mb-4 flex flex-wrap gap-2">
-          {watchlistSymbols.map((sym) => (
-            <button
+          {recentSymbols.map((sym) => (
+            <div
               key={sym}
-              onClick={() => handleAnalyze(sym)}
-              className={`text-xs px-2.5 py-1 rounded border transition-colors ${sym === symbol ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-slate-600 bg-slate-800 text-slate-300 hover:border-indigo-500"}`}
+              className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded border transition-colors ${sym === symbol ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-slate-600 bg-slate-800 text-slate-300"}`}
             >
-              {sym}
-            </button>
+              <button
+                onClick={() => handleAnalyze(sym)}
+                className="hover:text-white"
+              >
+                {sym}
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  removeViewHistorySymbol(sym);
+                }}
+                disabled={historyBusy === sym}
+                className="text-[10px] leading-none px-1 rounded border border-slate-500/40 hover:border-red-400 hover:text-red-300 disabled:opacity-50"
+                title="Remove from history"
+              >
+                x
+              </button>
+            </div>
           ))}
         </div>
       )}
@@ -1507,8 +896,6 @@ export default function Dashboard() {
         </div>
 
         <div className="space-y-4">
-          <WatchlistPanel onSelect={handleAnalyze} onItemsChange={setWatchlistItems} />
-
           {signal && (
             <div className={`rounded-xl border p-4 ${actionBg(signal.action)}`}>
               <div className="flex items-center justify-between mb-3"><h2 className="font-semibold text-slate-200">Overall Signal</h2><span className={`text-2xl font-black ${actionColor(signal.action)}`}>{signal.action}</span></div>
@@ -1516,6 +903,17 @@ export default function Dashboard() {
                 <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">D: {signal.trend_action ?? signal.action}</span>
                 <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">H: {signal.timing_action ?? signal.action}</span>
                 {signal.is_special_signal && <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">Special</span>}
+              </div>
+              <div className="mb-2">
+                <p className="text-[11px] text-slate-400 mb-1">Multi-timeframe view</p>
+                <div className="flex flex-wrap gap-1.5 text-[10px]">
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">30m: {signal.timeframe_bias?.["30m"] ?? signal.timing_action ?? signal.action}</span>
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">1h: {signal.timeframe_bias?.["1h"] ?? signal.timing_action ?? signal.action}</span>
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">4h: {signal.timeframe_bias?.["4h"] ?? signal.timing_action ?? signal.action}</span>
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">1d: {signal.timeframe_bias?.["1d"] ?? signal.trend_action ?? signal.action}</span>
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">1w: {signal.weekly_action ?? signal.timeframe_bias?.["1mo"] ?? signal.trend_action ?? signal.action}</span>
+                  <span className="px-2 py-0.5 rounded border border-slate-600 bg-slate-800/70">1mo: {signal.timeframe_bias?.["1mo"] ?? signal.weekly_action ?? signal.trend_action ?? signal.action}</span>
+                </div>
               </div>
               <ProbBar buy={signal.buy_pct} sell={signal.sell_pct} hold={signal.hold_pct} />
               <p className="text-xs text-slate-500 mt-2">{signal.timestamp ? new Date(signal.timestamp).toISOString().replace("T", " ").slice(0, 19) : ""}</p>
@@ -1547,10 +945,22 @@ export default function Dashboard() {
             </div>
           )}
 
+        </div>
+      </div>
+
+      <section className="mt-6 rounded-2xl border border-slate-700/80 bg-slate-900/40 p-4 md:p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <p className="text-[11px] uppercase tracking-[0.16em] text-slate-500">System</p>
+            <h2 className="text-base md:text-lg font-semibold text-slate-200">System Monitor</h2>
+          </div>
+          <p className="text-[11px] text-slate-500">Infrastructure and data-source health</p>
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <SourceStatusPanel />
           <DBStatsPanel />
         </div>
-      </div>
+      </section>
     </div>
   );
 }

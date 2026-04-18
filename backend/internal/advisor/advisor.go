@@ -50,25 +50,27 @@ type SignalScore struct {
 
 // Recommendation is the final output.
 type Recommendation struct {
-	TargetSymbol string
-	BuyPercent   float64
-	SellPercent  float64
-	HoldPercent  float64
-	Action       string
-	TrendAction  string
-	TimingAction string
-	TimingTF     string
-	WeeklyAction string
-	WeeklyChange float64
-	IsSpecial    bool
-	Reason       string
-	USDKRWRate   float64
-	Snapshot     map[string]marketdata.Quote
-	Indicators   Indicators
-	Timing       Indicators
-	Score        SignalScore
-	TimingScore  SignalScore
-	Timestamp    time.Time
+	TargetSymbol  string
+	FullName      string
+	BuyPercent    float64
+	SellPercent   float64
+	HoldPercent   float64
+	Action        string
+	TrendAction   string
+	TimingAction  string
+	TimingTF      string
+	WeeklyAction  string
+	WeeklyChange  float64
+	IsSpecial     bool
+	Reason        string
+	USDKRWRate    float64
+	Snapshot      map[string]marketdata.Quote
+	Indicators    Indicators
+	Timing        Indicators
+	Score         SignalScore
+	TimingScore   SignalScore
+	TimeframeBias map[string]string
+	Timestamp     time.Time
 }
 
 func RequiredSymbols() []string {
@@ -79,6 +81,43 @@ func PopularLeaderSymbols() []string {
 	cloned := make([]string, len(popularLeaderSymbols))
 	copy(cloned, popularLeaderSymbols)
 	return cloned
+}
+
+func SymbolFullName(symbol string) string {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "TQQQ":
+		return "ProShares UltraPro QQQ"
+	case "QQQ":
+		return "Invesco QQQ Trust"
+	case "SPY":
+		return "SPDR S&P 500 ETF Trust"
+	case "SOXL":
+		return "Direxion Daily Semiconductor Bull 3X"
+	case "SOXX":
+		return "iShares Semiconductor ETF"
+	case "NVDA":
+		return "NVIDIA Corporation"
+	case "TSLA":
+		return "Tesla, Inc."
+	case "AAPL":
+		return "Apple Inc."
+	case "MSFT":
+		return "Microsoft Corporation"
+	case "AMZN":
+		return "Amazon.com, Inc."
+	case "META":
+		return "Meta Platforms, Inc."
+	case "GOOGL":
+		return "Alphabet Inc. Class A"
+	case "AMD":
+		return "Advanced Micro Devices, Inc."
+	case "PLTR":
+		return "Palantir Technologies Inc."
+	case "SMCI":
+		return "Super Micro Computer, Inc."
+	default:
+		return ""
+	}
 }
 
 // Evaluate computes Buy/Hold/Sell probabilities purely from chart indicators.
@@ -96,23 +135,25 @@ func Evaluate(symbol string, snapshot map[string]marketdata.Quote, closes []floa
 	weeklyAction, weeklyChange := weeklyBiasFromCloses(closes)
 
 	return Recommendation{
-		TargetSymbol: symbol,
-		BuyPercent:   buy,
-		SellPercent:  sell,
-		HoldPercent:  hold,
-		Action:       action,
-		TrendAction:  action,
-		TimingAction: action,
-		TimingTF:     "1d",
-		WeeklyAction: weeklyAction,
-		WeeklyChange: weeklyChange,
-		Reason:       strings.Join(reasons, "; "),
-		Snapshot:     snapshot,
-		Indicators:   ind,
-		Timing:       ind,
-		Score:        score,
-		TimingScore:  score,
-		Timestamp:    now,
+		TargetSymbol:  symbol,
+		FullName:      SymbolFullName(symbol),
+		BuyPercent:    buy,
+		SellPercent:   sell,
+		HoldPercent:   hold,
+		Action:        action,
+		TrendAction:   action,
+		TimingAction:  action,
+		TimingTF:      "1d",
+		WeeklyAction:  weeklyAction,
+		WeeklyChange:  weeklyChange,
+		Reason:        strings.Join(reasons, "; "),
+		Snapshot:      snapshot,
+		Indicators:    ind,
+		Timing:        ind,
+		Score:         score,
+		TimingScore:   score,
+		TimeframeBias: map[string]string{"1d": action, "1mo": weeklyAction},
+		Timestamp:     now,
 	}, nil
 }
 
@@ -160,23 +201,25 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 	)
 
 	return Recommendation{
-		TargetSymbol: symbol,
-		BuyPercent:   buy,
-		SellPercent:  sell,
-		HoldPercent:  hold,
-		Action:       action,
-		TrendAction:  trendAction,
-		TimingAction: timingAction,
-		WeeklyAction: weeklyAction,
-		WeeklyChange: weeklyChange,
-		IsSpecial:    isSpecial,
-		Reason:       reason,
-		Snapshot:     snapshot,
-		Indicators:   dailyInd,
-		Timing:       timingInd,
-		Score:        dailyScore,
-		TimingScore:  timingScore,
-		Timestamp:    now,
+		TargetSymbol:  symbol,
+		FullName:      SymbolFullName(symbol),
+		BuyPercent:    buy,
+		SellPercent:   sell,
+		HoldPercent:   hold,
+		Action:        action,
+		TrendAction:   trendAction,
+		TimingAction:  timingAction,
+		WeeklyAction:  weeklyAction,
+		WeeklyChange:  weeklyChange,
+		IsSpecial:     isSpecial,
+		Reason:        reason,
+		Snapshot:      snapshot,
+		Indicators:    dailyInd,
+		Timing:        timingInd,
+		Score:         dailyScore,
+		TimingScore:   timingScore,
+		TimeframeBias: map[string]string{"1d": trendAction, "1mo": weeklyAction},
+		Timestamp:     now,
 	}, nil
 }
 
@@ -329,6 +372,14 @@ func FormatMessage(r Recommendation) string {
 	if r.Indicators.SupertrendDir < 0 {
 		stDir = "Bearish(하락)"
 	}
+	fullName := r.FullName
+	if strings.TrimSpace(fullName) == "" {
+		fullName = SymbolFullName(r.TargetSymbol)
+	}
+	title := r.TargetSymbol
+	if fullName != "" {
+		title = fmt.Sprintf("%s | %s", r.TargetSymbol, fullName)
+	}
 
 	// Best-effort market context from snapshot
 	vixPct, nqPct := 0.0, 0.0
@@ -344,6 +395,11 @@ func FormatMessage(r Recommendation) string {
 		currentPrice = r.Indicators.SMA20
 	}
 	intradayLabel := timingTFLabel(r.TimingTF)
+	tf30 := actionWithKorean(directionAt(r.TimeframeBias, "30m", r.TimingAction))
+	tf1h := actionWithKorean(directionAt(r.TimeframeBias, "1h", r.TimingAction))
+	tf4h := actionWithKorean(directionAt(r.TimeframeBias, "4h", r.TimingAction))
+	tf1d := actionWithKorean(directionAt(r.TimeframeBias, "1d", r.TrendAction))
+	tf1mo := actionWithKorean(directionAt(r.TimeframeBias, "1mo", r.WeeklyAction))
 	weeklyAction := r.WeeklyAction
 	if weeklyAction == "" {
 		weeklyAction = r.TrendAction
@@ -368,6 +424,12 @@ func FormatMessage(r Recommendation) string {
 			"[%s] %s %s\n"+
 			"Direction(방향 D): %s %s | Timing(타이밍 H): %s %s\n"+
 			"Buy(상승): %.0f%% | Hold(횡보): %.0f%% | Sell(하락): %.0f%%\n\n"+
+			"Multi-timeframe Direction (다중 타임프레임 방향성)\n"+
+			"- 30m: %s\n"+
+			"- 1h: %s\n"+
+			"- 4h: %s\n"+
+			"- 1d: %s\n"+
+			"- 1mo: %s\n\n"+
 			"Execution Guide(실행 가이드)\n"+
 			"- Current Price(현재가): $%.2f\n"+
 			"- 1D Bias(방향): %s %s\n"+
@@ -378,20 +440,25 @@ func FormatMessage(r Recommendation) string {
 			"- %s: $%.2f\n"+
 			"- %s: $%.2f\n"+
 			"- %s: $%.2f\n\n"+
-			"Indicators(지표)\n"+
-			"- RSI14: %.1f\n"+
-			"- SMA20: %.2f | SMA50: %.2f\n"+
-			"- BB: %.2f / %.2f / %.2f\n"+
-			"- Supertrend: %s (%.2f)\n"+
-			"- ATR14: %.2f\n\n"+
+			"Indicators(지표, 한글 설명 포함)\n"+
+			"- RSI14(상대강도지수): %.1f (과열/침체 강도 확인)\n"+
+			"- SMA20/50(단순이동평균): %.2f / %.2f (단기/중기 추세선)\n"+
+			"- BB(볼린저밴드 상/중/하): %.2f / %.2f / %.2f (변동성 범위)\n"+
+			"- Supertrend(추세전환선): %s (%.2f)\n"+
+			"- ATR14(평균진폭): %.2f (손절/목표 거리 기준)\n\n"+
 			"Market(시장)\n"+
 			"- %s: $%.2f (%+.2f%%)\n"+
 			"- VIX: %+.2f%% | NQ: %+.2f%%\n"+
 			"- USD/KRW: %.2f",
 		r.Timestamp.Format("2006-01-02 15:04 KST"),
-		r.TargetSymbol, actionSignalEmoji(r.Action), actionWithKorean(r.Action),
+		title, actionSignalEmoji(r.Action), actionWithKorean(r.Action),
 		actionSignalEmoji(r.TrendAction), actionWithKorean(r.TrendAction), actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),
 		r.BuyPercent, r.HoldPercent, r.SellPercent,
+		tf30,
+		tf1h,
+		tf4h,
+		tf1d,
+		tf1mo,
 		currentPrice,
 		actionSignalEmoji(r.TrendAction), actionWithKorean(r.TrendAction),
 		intradayLabel, actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),
@@ -407,6 +474,17 @@ func FormatMessage(r Recommendation) string {
 		vixPct, nqPct,
 		r.USDKRWRate,
 	)
+}
+
+func directionAt(tf map[string]string, key, fallback string) string {
+	if tf == nil {
+		return fallback
+	}
+	v := strings.TrimSpace(tf[key])
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 func weeklyBiasFromCloses(closes []float64) (string, float64) {

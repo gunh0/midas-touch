@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,8 +29,8 @@ import (
 
 const (
 	defaultSymbol         = advisor.SymbolNVDA
-	defaultIntervalHour   = 4
-	monitorTickInterval   = 5 * time.Minute
+	defaultIntervalMinute = 3
+	monitorTickInterval   = 20 * time.Second
 	specialCooldownPeriod = 60 * time.Minute
 	popularScanTF         = "120"
 	dbFreeTierLimitMB     = 500.0
@@ -113,7 +114,16 @@ func main() {
 	if popularBuyMinPct > 100 {
 		popularBuyMinPct = 100
 	}
+	monitorMaxWorkers := parseIntWithDefault(os.Getenv("MONITOR_MAX_WORKERS"), 4)
+	if monitorMaxWorkers <= 0 {
+		monitorMaxWorkers = 1
+	}
+	popularScanMaxWorkers := parseIntWithDefault(os.Getenv("POPULAR_SCAN_MAX_WORKERS"), 3)
+	if popularScanMaxWorkers <= 0 {
+		popularScanMaxWorkers = 1
+	}
 	var lastPopularScanAt time.Time
+	lastScannedSlotBySymbol := map[string]int64{}
 
 	monitorOnce := func() {
 		now := time.Now()
@@ -153,76 +163,119 @@ func main() {
 			return
 		}
 		if len(items) == 0 {
-			if err := db.AddToWatchlist(ctx, defaultSymbol, defaultIntervalHour, "event"); err != nil {
+			if err := db.AddToWatchlist(ctx, defaultSymbol, defaultIntervalMinute, "event"); err != nil {
 				log.Printf("seed watchlist: %v", err)
 				return
 			}
 			items, _ = db.GetWatchlist(ctx)
 		}
 
+		type monitorJob struct {
+			item         mongodb.WatchlistItem
+			timingTF     string
+			notifyMode   string
+			intervalMins int
+		}
+		jobsToRun := make([]monitorJob, 0, len(items))
+
 		for _, item := range items {
-			intervalHour := item.NotifyIntervalHour
-			if intervalHour <= 0 {
-				intervalHour = defaultIntervalHour
+			intervalMinute := item.NotifyIntervalMinute
+			if intervalMinute <= 0 {
+				intervalMinute = item.NotifyIntervalHour * 60
 			}
-			timingTF := timeframeFromIntervalHour(intervalHour)
+			if intervalMinute <= 0 {
+				intervalMinute = defaultIntervalMinute
+			}
+
+			if !isAlignedScanSlot(now, intervalMinute) {
+				continue
+			}
+			slot := now.Unix() / 60
+			normalizedSymbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
+			if lastSlot, exists := lastScannedSlotBySymbol[normalizedSymbol]; exists && lastSlot == slot {
+				continue
+			}
+			lastScannedSlotBySymbol[normalizedSymbol] = slot
+
+			timingTF := timeframeFromIntervalMinute(intervalMinute)
 			notifyMode := strings.ToLower(strings.TrimSpace(item.NotifyMode))
 			if notifyMode == "" {
 				notifyMode = "event"
 			}
 
-			reco, err := signalSvc.Evaluate(ctx, item.Symbol, timingTF)
-			if err != nil {
-				log.Printf("evaluate %s: %v", item.Symbol, err)
-				continue
+			jobsToRun = append(jobsToRun, monitorJob{
+				item:         item,
+				timingTF:     timingTF,
+				notifyMode:   notifyMode,
+				intervalMins: intervalMinute,
+			})
+		}
+
+		if len(jobsToRun) > 0 {
+			workers := monitorMaxWorkers
+			if workers > len(jobsToRun) {
+				workers = len(jobsToRun)
 			}
 
-			if err := signalSvc.AutoPrune(ctx, item.Symbol); err != nil {
-				log.Printf("warn: auto prune %s: %v", item.Symbol, err)
+			jobCh := make(chan monitorJob, len(jobsToRun))
+			var wg sync.WaitGroup
+			for i := 0; i < workers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for job := range jobCh {
+						reco, err := signalSvc.EvaluateCached(ctx, job.item.Symbol, job.timingTF)
+						if err != nil {
+							log.Printf("evaluate %s: %v", job.item.Symbol, err)
+							continue
+						}
+
+						if err := signalSvc.AutoPrune(ctx, job.item.Symbol); err != nil {
+							log.Printf("warn: auto prune %s: %v", job.item.Symbol, err)
+						}
+
+						shouldNotify := false
+						specialDue := false
+						why := ""
+						lastNotified, err := db.GetLatestNotifiedSignal(ctx, job.item.Symbol)
+						if err != nil {
+							log.Printf("warn: latest notified signal %s: %v", job.item.Symbol, err)
+							continue
+						}
+
+						if job.notifyMode == "interval" {
+							shouldNotify, specialDue, why = shouldNotifyInterval(reco, lastNotified, job.item, policy, now)
+						} else {
+							shouldNotify, specialDue, why = shouldNotifyEvent(reco, lastNotified, job.item, policy, now)
+						}
+
+						if !shouldNotify {
+							log.Printf("skip notify symbol=%s action=%s mode=%s reason=%s", job.item.Symbol, reco.Action, job.notifyMode, why)
+							continue
+						}
+
+						msg := advisor.FormatMessage(reco)
+						msg = formatSignalHeader(job.notifyMode, specialDue, why) + "\n\n" + msg
+
+						if err := tgClient.SendMessage(msg); err != nil {
+							log.Printf("telegram send %s: %v", job.item.Symbol, err)
+							continue
+						}
+
+						signalSvc.SaveSignal(ctx, job.item.Symbol, reco, true)
+						if err := db.MarkWatchlistNotified(ctx, job.item.Symbol, specialDue, now); err != nil {
+							log.Printf("warn: mark notified %s: %v", job.item.Symbol, err)
+						}
+						log.Printf("notified symbol=%s action=%s mode=%s special=%t reason=%s", job.item.Symbol, reco.Action, job.notifyMode, specialDue, why)
+					}
+				}()
 			}
 
-			shouldNotify := false
-			specialDue := false
-			why := ""
-
-			if notifyMode == "interval" {
-				normalDue := item.LastNotifiedAt == nil || now.Sub(*item.LastNotifiedAt) >= time.Duration(intervalHour)*time.Hour
-				specialDue = reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
-				shouldNotify = normalDue || specialDue
-				if specialDue && !normalDue {
-					why = fmt.Sprintf("interval mode + special override (%dh)", intervalHour)
-				} else if normalDue {
-					why = fmt.Sprintf("interval due (%dh)", intervalHour)
-				} else {
-					why = "interval wait"
-				}
-			} else {
-				lastNotified, err := db.GetLatestNotifiedSignal(ctx, item.Symbol)
-				if err != nil {
-					log.Printf("warn: latest notified signal %s: %v", item.Symbol, err)
-					continue
-				}
-				shouldNotify, specialDue, why = shouldNotifyEvent(reco, lastNotified, item, policy, now)
+			for _, job := range jobsToRun {
+				jobCh <- job
 			}
-
-			if !shouldNotify {
-				log.Printf("skip notify symbol=%s action=%s mode=%s reason=%s", item.Symbol, reco.Action, notifyMode, why)
-				continue
-			}
-
-			msg := advisor.FormatMessage(reco)
-			msg = formatSignalHeader(notifyMode, specialDue, why) + "\n\n" + msg
-
-			if err := tgClient.SendMessage(msg); err != nil {
-				log.Printf("telegram send %s: %v", item.Symbol, err)
-				continue
-			}
-
-			signalSvc.SaveSignal(ctx, item.Symbol, reco, true)
-			if err := db.MarkWatchlistNotified(ctx, item.Symbol, specialDue, now); err != nil {
-				log.Printf("warn: mark notified %s: %v", item.Symbol, err)
-			}
-			log.Printf("notified symbol=%s action=%s mode=%s special=%t reason=%s", item.Symbol, reco.Action, notifyMode, specialDue, why)
+			close(jobCh)
+			wg.Wait()
 		}
 
 		if lastPopularScanAt.IsZero() || now.Sub(lastPopularScanAt) >= time.Duration(popularScanInterval)*time.Hour {
@@ -234,17 +287,44 @@ func main() {
 			}
 			candidates := make([]advisor.Recommendation, 0, len(symbols))
 
-			for _, symbol := range symbols {
-				reco, err := signalSvc.Evaluate(ctx, symbol, popularScanTF)
-				if err != nil {
-					log.Printf("popular scan evaluate %s: %v", symbol, err)
-					continue
-				}
+			workers := popularScanMaxWorkers
+			if workers > len(symbols) {
+				workers = len(symbols)
+			}
+			if workers < 1 {
+				workers = 1
+			}
 
-				signalSvc.SaveSignal(ctx, symbol, reco, false)
-				if isBuyCandidate(reco, popularBuyMinPct) {
-					candidates = append(candidates, reco)
-				}
+			jobCh := make(chan string, len(symbols))
+			candCh := make(chan advisor.Recommendation, len(symbols))
+			var wg sync.WaitGroup
+			for i := 0; i < workers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for symbol := range jobCh {
+						reco, err := signalSvc.EvaluateCached(ctx, symbol, popularScanTF)
+						if err != nil {
+							log.Printf("popular scan evaluate %s: %v", symbol, err)
+							continue
+						}
+
+						signalSvc.SaveSignal(ctx, symbol, reco, false)
+						if isBuyCandidate(reco, popularBuyMinPct) {
+							candCh <- reco
+						}
+					}
+				}()
+			}
+
+			for _, symbol := range symbols {
+				jobCh <- symbol
+			}
+			close(jobCh)
+			wg.Wait()
+			close(candCh)
+			for reco := range candCh {
+				candidates = append(candidates, reco)
 			}
 
 			if len(candidates) > 0 {
@@ -354,7 +434,7 @@ func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float
 	b.WriteString("\n")
 
 	for _, reco := range highlights {
-		name := popularSymbolName(reco.TargetSymbol)
+		name := advisor.SymbolFullName(reco.TargetSymbol)
 		heading := reco.TargetSymbol
 		if name != "" {
 			heading = fmt.Sprintf("%s | %s", reco.TargetSymbol, name)
@@ -377,43 +457,6 @@ func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float
 	}
 
 	return strings.TrimSpace(b.String())
-}
-
-func popularSymbolName(symbol string) string {
-	switch strings.ToUpper(strings.TrimSpace(symbol)) {
-	case "TQQQ":
-		return "ProShares UltraPro QQQ"
-	case "QQQ":
-		return "Invesco QQQ Trust"
-	case "SPY":
-		return "SPDR S&P 500 ETF Trust"
-	case "SOXL":
-		return "Direxion Daily Semiconductor Bull 3X"
-	case "SOXX":
-		return "iShares Semiconductor ETF"
-	case "NVDA":
-		return "NVIDIA"
-	case "TSLA":
-		return "Tesla"
-	case "AAPL":
-		return "Apple"
-	case "MSFT":
-		return "Microsoft"
-	case "AMZN":
-		return "Amazon"
-	case "META":
-		return "Meta Platforms"
-	case "GOOGL":
-		return "Alphabet Class A"
-	case "AMD":
-		return "Advanced Micro Devices"
-	case "PLTR":
-		return "Palantir Technologies"
-	case "SMCI":
-		return "Super Micro Computer"
-	default:
-		return ""
-	}
 }
 
 func selectPopularHighlights(candidates []advisor.Recommendation) []advisor.Recommendation {
@@ -501,17 +544,8 @@ func shouldNotifyEvent(reco advisor.Recommendation, last *mongodb.SignalDoc, ite
 		return true, true, "special signal"
 	}
 
-	if item.LastNotifiedAt != nil && now.Sub(*item.LastNotifiedAt) < policy.Cooldown {
-		return false, false, "cooldown"
-	}
-
 	if reco.Action == "HOLD" {
 		return false, false, "hold filtered"
-	}
-
-	currStrength := actionStrengthFromRecommendation(reco)
-	if currStrength < policy.MinActionPct {
-		return false, false, fmt.Sprintf("weak confidence %.0f<%.0f", currStrength, policy.MinActionPct)
 	}
 
 	if last == nil {
@@ -522,12 +556,52 @@ func shouldNotifyEvent(reco advisor.Recommendation, last *mongodb.SignalDoc, ite
 		return true, false, fmt.Sprintf("action changed %s->%s", last.Action, reco.Action)
 	}
 
+	if item.LastNotifiedAt != nil && now.Sub(*item.LastNotifiedAt) < policy.Cooldown {
+		return false, false, "cooldown (same action)"
+	}
+
+	currStrength := actionStrengthFromRecommendation(reco)
+	if currStrength < policy.MinActionPct {
+		return false, false, fmt.Sprintf("weak confidence %.0f<%.0f", currStrength, policy.MinActionPct)
+	}
+
 	lastStrength := actionStrengthFromSignal(*last)
 	if math.Abs(currStrength-lastStrength) >= policy.MinDeltaPct {
 		return true, false, fmt.Sprintf("confidence changed %.0f->%.0f", lastStrength, currStrength)
 	}
 
 	return false, false, "no meaningful change"
+}
+
+func shouldNotifyInterval(reco advisor.Recommendation, last *mongodb.SignalDoc, item mongodb.WatchlistItem, policy AlertPolicy, now time.Time) (bool, bool, string) {
+	specialDue := reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
+	if specialDue {
+		return true, true, "interval + special signal"
+	}
+
+	if reco.Action == "HOLD" {
+		return false, false, "interval slot but hold filtered"
+	}
+
+	currStrength := actionStrengthFromRecommendation(reco)
+	if currStrength < policy.MinActionPct {
+		return false, false, fmt.Sprintf("interval slot but weak confidence %.0f<%.0f", currStrength, policy.MinActionPct)
+	}
+
+	if last == nil {
+		return true, false, "interval first actionable signal"
+	}
+
+	if reco.Action != last.Action {
+		return true, false, fmt.Sprintf("interval action changed %s->%s", last.Action, reco.Action)
+	}
+
+	lastStrength := actionStrengthFromSignal(*last)
+	if math.Abs(currStrength-lastStrength) >= policy.MinDeltaPct {
+		return true, false, fmt.Sprintf("interval confidence changed %.0f->%.0f", lastStrength, currStrength)
+	}
+
+	return false, false, "interval slot but no meaningful change"
 }
 
 func actionStrengthFromRecommendation(reco advisor.Recommendation) float64 {
@@ -552,17 +626,44 @@ func actionStrengthFromSignal(sig mongodb.SignalDoc) float64 {
 	}
 }
 
-func timeframeFromIntervalHour(hours int) string {
-	if hours <= 1 {
+func timeframeFromIntervalMinute(minutes int) string {
+	if minutes <= 15 {
+		return "30"
+	}
+	if minutes <= 60 {
 		return "60"
 	}
-	if hours <= 2 {
+	if minutes <= 180 {
 		return "120"
 	}
-	if hours <= 4 {
-		return "240"
-	}
 	return "240"
+}
+
+func isAlignedScanSlot(now time.Time, intervalMinute int) bool {
+	if intervalMinute <= 0 {
+		intervalMinute = defaultIntervalMinute
+	}
+	minute := now.Minute()
+
+	// Minute-based intervals follow wall-clock boundaries and start at :interval
+	// (e.g. 3m => :03/:06..., 5m => :05/:10...).
+	if intervalMinute < 60 {
+		return minute != 0 && minute%intervalMinute == 0
+	}
+
+	if intervalMinute == 60 {
+		return minute == 0
+	}
+
+	if minute != 0 {
+		return false
+	}
+
+	hours := intervalMinute / 60
+	if hours <= 0 {
+		hours = 1
+	}
+	return now.Hour()%hours == 0
 }
 
 func watchlistSymbols(items []mongodb.WatchlistItem) []string {
