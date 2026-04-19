@@ -66,6 +66,7 @@ func NewRouter(h *Handler) *gin.Engine {
 		api.GET("/watchlist", h.getWatchlist)
 		api.POST("/watchlist", h.addWatchlist)
 		api.POST("/watchlist/pin", h.pinWatchlist)
+		api.POST("/watchlist/favorites/analyze-notify", h.analyzeNotifyFavorites)
 		api.POST("/watchlist/reorder", h.reorderWatchlist)
 		api.DELETE("/watchlist", h.removeWatchlist)
 		api.GET("/db/stats", h.dbStats)
@@ -403,6 +404,85 @@ func (h *Handler) notify(c *gin.Context) {
 	h.signalSvc.SaveSignal(c.Request.Context(), symbol, reco, true)
 
 	c.JSON(http.StatusOK, gin.H{"ok": true, "symbol": reco.TargetSymbol, "action": reco.Action, "is_special": reco.IsSpecial})
+}
+
+func (h *Handler) analyzeNotifyFavorites(c *gin.Context) {
+	timingTF := service.NormalizeTimeframe(c.Query("timing_tf"))
+	if timingTF == "1d" {
+		timingTF = "120"
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
+	defer cancel()
+
+	items, err := h.db.GetWatchlist(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	favorites := make([]mongodb.WatchlistItem, 0, len(items))
+	for _, item := range items {
+		if item.Pinned {
+			favorites = append(favorites, item)
+		}
+	}
+
+	if len(favorites) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"ok":           true,
+			"target_count": 0,
+			"sent_count":   0,
+			"buy_count":    0,
+			"hold_count":   0,
+			"sell_count":   0,
+			"failed":       []gin.H{},
+		})
+		return
+	}
+
+	sentCount := 0
+	buyCount := 0
+	holdCount := 0
+	sellCount := 0
+	failed := make([]gin.H, 0)
+
+	for i, item := range favorites {
+		reco, evalErr := h.signalSvc.Evaluate(ctx, item.Symbol, timingTF)
+		if evalErr != nil {
+			failed = append(failed, gin.H{"symbol": item.Symbol, "stage": "evaluate", "error": evalErr.Error()})
+			continue
+		}
+
+		switch reco.Action {
+		case "BUY":
+			buyCount++
+		case "SELL":
+			sellCount++
+		default:
+			holdCount++
+		}
+
+		header := fmt.Sprintf("⭐ 즐겨찾기 일괄 분석 [FAVORITES] %d/%d symbol=%s timing=%s", i+1, len(favorites), reco.TargetSymbol, strings.ToUpper(timingTF))
+		msg := header + "\n\n" + advisor.FormatMessage(reco)
+		if sendErr := h.tgClient.SendMessage(msg); sendErr != nil {
+			failed = append(failed, gin.H{"symbol": item.Symbol, "stage": "notify", "error": sendErr.Error()})
+			continue
+		}
+
+		h.signalSvc.SaveSignal(ctx, item.Symbol, reco, true)
+		sentCount++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":           true,
+		"target_count": len(favorites),
+		"sent_count":   sentCount,
+		"buy_count":    buyCount,
+		"hold_count":   holdCount,
+		"sell_count":   sellCount,
+		"failed":       failed,
+	})
 }
 
 func (h *Handler) signals(c *gin.Context) {

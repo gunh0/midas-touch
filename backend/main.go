@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +31,6 @@ const (
 	defaultIntervalMinute = 3
 	monitorTickInterval   = 20 * time.Second
 	specialCooldownPeriod = 60 * time.Minute
-	popularScanTF         = "120"
 	dbFreeTierLimitMB     = 500.0
 	dbAlertThresholdRatio = 0.80
 	dbAlertCooldown       = 6 * time.Hour
@@ -103,26 +101,10 @@ func main() {
 		MinDeltaPct:  alertMinDeltaPct,
 		Cooldown:     time.Duration(alertCooldownMins) * time.Minute,
 	}
-	popularScanInterval := parseIntWithDefault(os.Getenv("POPULAR_SCAN_INTERVAL_HOURS"), 4)
-	if popularScanInterval <= 0 {
-		popularScanInterval = 4
-	}
-	popularBuyMinPct := parseFloatWithDefault(os.Getenv("POPULAR_BUY_MIN_PCT"), 55)
-	if popularBuyMinPct < 0 {
-		popularBuyMinPct = 0
-	}
-	if popularBuyMinPct > 100 {
-		popularBuyMinPct = 100
-	}
 	monitorMaxWorkers := parseIntWithDefault(os.Getenv("MONITOR_MAX_WORKERS"), 4)
 	if monitorMaxWorkers <= 0 {
 		monitorMaxWorkers = 1
 	}
-	popularScanMaxWorkers := parseIntWithDefault(os.Getenv("POPULAR_SCAN_MAX_WORKERS"), 3)
-	if popularScanMaxWorkers <= 0 {
-		popularScanMaxWorkers = 1
-	}
-	var lastPopularScanAt time.Time
 	lastScannedSlotBySymbol := map[string]int64{}
 
 	monitorOnce := func() {
@@ -278,68 +260,6 @@ func main() {
 			wg.Wait()
 		}
 
-		if lastPopularScanAt.IsZero() || now.Sub(lastPopularScanAt) >= time.Duration(popularScanInterval)*time.Hour {
-			symbols := watchlistSymbols(items)
-			if len(symbols) == 0 {
-				log.Printf("watchlist scan: skipped (no watchlist symbols)")
-				lastPopularScanAt = now
-				return
-			}
-			candidates := make([]advisor.Recommendation, 0, len(symbols))
-
-			workers := popularScanMaxWorkers
-			if workers > len(symbols) {
-				workers = len(symbols)
-			}
-			if workers < 1 {
-				workers = 1
-			}
-
-			jobCh := make(chan string, len(symbols))
-			candCh := make(chan advisor.Recommendation, len(symbols))
-			var wg sync.WaitGroup
-			for i := 0; i < workers; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for symbol := range jobCh {
-						reco, err := signalSvc.EvaluateCached(ctx, symbol, popularScanTF)
-						if err != nil {
-							log.Printf("popular scan evaluate %s: %v", symbol, err)
-							continue
-						}
-
-						signalSvc.SaveSignal(ctx, symbol, reco, false)
-						if isBuyCandidate(reco, popularBuyMinPct) {
-							candCh <- reco
-						}
-					}
-				}()
-			}
-
-			for _, symbol := range symbols {
-				jobCh <- symbol
-			}
-			close(jobCh)
-			wg.Wait()
-			close(candCh)
-			for reco := range candCh {
-				candidates = append(candidates, reco)
-			}
-
-			if len(candidates) > 0 {
-				msg := formatPopularBuyDigest(candidates, popularBuyMinPct, popularScanInterval)
-				if err := tgClient.SendMessage(msg); err != nil {
-					log.Printf("popular scan telegram send: %v", err)
-				} else {
-					log.Printf("watchlist scan notified: %d candidates (symbols=%d)", len(candidates), len(symbols))
-				}
-			} else {
-				log.Printf("watchlist scan: no BUY candidates (min_buy_pct=%.0f, symbols=%d)", popularBuyMinPct, len(symbols))
-			}
-
-			lastPopularScanAt = now
-		}
 	}
 
 	monitorOnce()
@@ -403,119 +323,6 @@ func parseFloatWithDefault(value string, fallback float64) float64 {
 		return fallback
 	}
 	return n
-}
-
-func isBuyCandidate(reco advisor.Recommendation, minBuyPct float64) bool {
-	if reco.Action != "BUY" {
-		return false
-	}
-	if reco.BuyPercent < minBuyPct {
-		return false
-	}
-	if reco.TrendAction == "SELL" || reco.TimingAction == "SELL" {
-		return false
-	}
-	return true
-}
-
-func formatPopularBuyDigest(candidates []advisor.Recommendation, minBuyPct float64, scanIntervalHours int) string {
-	highlights := selectPopularHighlights(candidates)
-
-	b := strings.Builder{}
-	b.WriteString("Watchlist Leaders Scan (DB 기반 알림 대상 스캔, 하이라이트)\n")
-	b.WriteString(fmt.Sprintf("조건: BUY && Buy>=%.0f%%\n", minBuyPct))
-	b.WriteString(fmt.Sprintf("시간: %s\n", time.Now().Format("2006-01-02 15:04 KST")))
-	b.WriteString(fmt.Sprintf("발송 주기: %d시간마다 스캔 시\n", scanIntervalHours))
-	b.WriteString("발송 조건: 후보가 1개 이상일 때만 전송\n")
-	b.WriteString(fmt.Sprintf("전체 후보 %d개 중 상위 %d개만 전송\n", len(candidates), len(highlights)))
-	if len(candidates) > len(highlights) {
-		b.WriteString("- 신호가 유사한 종목은 생략하고 상위 신뢰도만 표시합니다.\n")
-	}
-	b.WriteString("\n")
-
-	for _, reco := range highlights {
-		name := advisor.SymbolFullName(reco.TargetSymbol)
-		heading := reco.TargetSymbol
-		if name != "" {
-			heading = fmt.Sprintf("%s | %s", reco.TargetSymbol, name)
-		}
-
-		b.WriteString(fmt.Sprintf(
-			"[%s] %s %s\n- Buy %.0f%% | Hold %.0f%% | Sell %.0f%%\n- Direction: %s %s | Timing: %s %s\n- Conviction: %.0f\n\n",
-			heading,
-			actionSignalEmoji(reco.Action),
-			actionWithKorean(reco.Action),
-			reco.BuyPercent,
-			reco.HoldPercent,
-			reco.SellPercent,
-			actionSignalEmoji(reco.TrendAction),
-			actionWithKorean(reco.TrendAction),
-			actionSignalEmoji(reco.TimingAction),
-			actionWithKorean(reco.TimingAction),
-			reco.BuyPercent-(reco.SellPercent*0.5),
-		))
-	}
-
-	return strings.TrimSpace(b.String())
-}
-
-func selectPopularHighlights(candidates []advisor.Recommendation) []advisor.Recommendation {
-	if len(candidates) == 0 {
-		return candidates
-	}
-
-	sorted := make([]advisor.Recommendation, len(candidates))
-	copy(sorted, candidates)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].BuyPercent == sorted[j].BuyPercent {
-			return sorted[i].TargetSymbol < sorted[j].TargetSymbol
-		}
-		return sorted[i].BuyPercent > sorted[j].BuyPercent
-	})
-
-	strong := make([]advisor.Recommendation, 0, len(sorted))
-	for _, reco := range sorted {
-		if reco.BuyPercent >= 70 && reco.TrendAction == "BUY" && reco.TimingAction == "BUY" {
-			strong = append(strong, reco)
-		}
-	}
-
-	selected := strong
-	if len(selected) == 0 {
-		selected = sorted
-	}
-
-	const maxItems = 5
-	if len(selected) > maxItems {
-		selected = selected[:maxItems]
-	}
-	return selected
-}
-
-func actionWithKorean(action string) string {
-	switch action {
-	case "BUY":
-		return "BUY(구매)"
-	case "SELL":
-		return "SELL(매도)"
-	case "HOLD":
-		return "HOLD(관망)"
-	default:
-		return action
-	}
-}
-
-func actionSignalEmoji(action string) string {
-	switch strings.ToUpper(strings.TrimSpace(action)) {
-	case "BUY":
-		return "🟢"
-	case "SELL":
-		return "🔴"
-	case "HOLD":
-		return "🟡"
-	default:
-		return "⚪"
-	}
 }
 
 func formatSignalHeader(notifyMode string, specialDue bool, reason string) string {
@@ -666,24 +473,3 @@ func isAlignedScanSlot(now time.Time, intervalMinute int) bool {
 	return now.Hour()%hours == 0
 }
 
-func watchlistSymbols(items []mongodb.WatchlistItem) []string {
-	if len(items) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(items))
-	result := make([]string, 0, len(items))
-	for _, item := range items {
-		symbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
-		if symbol == "" {
-			continue
-		}
-		if _, exists := seen[symbol]; exists {
-			continue
-		}
-		seen[symbol] = struct{}{}
-		result = append(result, symbol)
-	}
-
-	return result
-}

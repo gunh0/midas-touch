@@ -40,6 +40,16 @@ const MARKET_CAP_BASE_SYMBOLS = [
 
 const SCAN_TF = "120";
 
+type FavoriteAnalyzeNotifyResult = {
+  ok: boolean;
+  target_count: number;
+  sent_count: number;
+  buy_count: number;
+  hold_count: number;
+  sell_count: number;
+  failed?: Array<{ symbol?: string; stage?: string; error?: string }>;
+};
+
 const DASHBOARD_PREFS_STORAGE_KEY = "midas.dashboard.preferences";
 
 // ── Main dashboard ─────────────────────────────────────────────────────────
@@ -318,42 +328,31 @@ export default function Dashboard() {
     }
   };
 
-  const analyzeAllAlertTargets = async () => {
-    const targets = watchlistItems.map((x) => x.symbol);
-    if (targets.length === 0) {
-      setBatchMsg("No alert targets to analyze.");
+  const analyzeAllFavorites = async () => {
+    const favorites = watchlistItems.filter((x) => x.pinned).map((x) => x.symbol);
+    if (favorites.length === 0) {
+      setBatchMsg("No favorites to analyze.");
       return;
     }
     setBatchAnalyzing(true);
-    setBatchMsg("Analyzing alert targets sequentially...");
+    setBatchMsg("Analyzing favorites and sending Telegram messages sequentially...");
 
-    let buyCount = 0;
-    let sellCount = 0;
-    let holdCount = 0;
-    let sentCount = 0;
-    for (const sym of targets) {
-      try {
-        const s = await fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=${SCAN_TF}`);
-        if (s.action === "BUY") buyCount += 1;
-        else if (s.action === "SELL") sellCount += 1;
-        else holdCount += 1;
-
-        const actionable = s.action !== "HOLD";
-        const confidence = Math.max(s.buy_pct, s.sell_pct);
-        const shouldSend = actionable && (s.is_special_signal || confidence >= 60);
-        if (shouldSend) {
-          const notifyRes = await fetch(`${API_BASE}/api/notify?symbol=${sym}&timing_tf=${SCAN_TF}`, { method: "POST" });
-          if (notifyRes.ok) {
-            sentCount += 1;
-          }
-        }
-      } catch {
-        // keep going
+    try {
+      const res = await fetch(`${API_BASE}/api/watchlist/favorites/analyze-notify?timing_tf=${SCAN_TF}`, { method: "POST" });
+      const d = (await res.json().catch(() => ({}))) as Partial<FavoriteAnalyzeNotifyResult> & { error?: string };
+      if (!res.ok) {
+        throw new Error(d.error ?? "failed to analyze favorites");
       }
+
+      const failedCount = Array.isArray(d.failed) ? d.failed.length : 0;
+      const baseMsg = `Favorites analysis complete: target ${d.target_count ?? 0} | Sent ${d.sent_count ?? 0} | BUY ${d.buy_count ?? 0} / HOLD ${d.hold_count ?? 0} / SELL ${d.sell_count ?? 0}`;
+      setBatchMsg(failedCount > 0 ? `${baseMsg} | Failed ${failedCount}` : baseMsg);
+    } catch (e) {
+      setBatchMsg(`Failed to analyze favorites: ${String(e)}`);
+    } finally {
+      setBatchAnalyzing(false);
+      await loadUniverseScan();
     }
-    setBatchMsg(`Sequential analysis complete: BUY ${buyCount} / HOLD ${holdCount} / SELL ${sellCount} | Sent ${sentCount}`);
-    setBatchAnalyzing(false);
-    await loadUniverseScan();
   };
 
   const commitUniverseSymbol = async (sym: string) => {
@@ -549,6 +548,7 @@ export default function Dashboard() {
   const managedSet = new Set(managedSymbols);
   const alertsOnCount = watchlistItems.filter((x) => managedSet.has(String(x.symbol).toUpperCase())).length;
   const totalManagedCount = managedSymbols.length;
+  const favoriteCount = watchlistItems.filter((x) => x.pinned).length;
 
   const pinnedSet = new Set(
     watchlistItems.filter((x) => x.pinned).map((x) => String(x.symbol).toUpperCase()),
@@ -632,7 +632,7 @@ export default function Dashboard() {
             <span className="text-[11px] text-slate-400">Updated</span>
             <span className="text-xs font-mono text-cyan-300">{scanUpdatedAt || "--:--:--"}</span>
             <button onClick={loadUniverseScan} disabled={scanLoading} className="text-xs px-3 py-1.5 rounded border border-cyan-400/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20 transition-colors disabled:opacity-60">{scanLoading ? "Scanning..." : "Rescan"}</button>
-            <button onClick={analyzeAllAlertTargets} disabled={batchAnalyzing || watchlistItems.length === 0} className="text-xs px-3 py-1.5 rounded border border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-colors disabled:opacity-60">{batchAnalyzing ? "Analyzing..." : "Analyze All Alert Targets"}</button>
+            <button onClick={analyzeAllFavorites} disabled={batchAnalyzing || favoriteCount === 0} className="text-xs px-3 py-1.5 rounded border border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 transition-colors disabled:opacity-60">{batchAnalyzing ? "Analyzing..." : "Analyze All Favorites"}</button>
           </div>
         </div>
         {batchMsg && <div className="mb-3 rounded border border-slate-700 bg-slate-900/50 px-3 py-2 text-xs text-slate-300">{batchMsg}</div>}
