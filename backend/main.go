@@ -346,21 +346,26 @@ type AlertPolicy struct {
 }
 
 func shouldNotifyEvent(reco advisor.Recommendation, last *mongodb.SignalDoc, item mongodb.WatchlistItem, policy AlertPolicy, now time.Time) (bool, bool, string) {
-	specialDue := reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
-	if specialDue {
-		return true, true, "special signal"
-	}
-
 	if reco.Action == "HOLD" {
 		return false, false, "hold filtered"
 	}
 
 	if last == nil {
-		return true, false, "first actionable signal"
+		special := reco.IsSpecial
+		return true, special, "first actionable signal"
 	}
 
 	if reco.Action != last.Action {
-		return true, false, fmt.Sprintf("action changed %s->%s", last.Action, reco.Action)
+		special := reco.IsSpecial
+		return true, special, fmt.Sprintf("action changed %s->%s", last.Action, reco.Action)
+	}
+
+	// IsSpecial transition: not special → special (only when it first becomes special)
+	if reco.IsSpecial && !last.IsSpecial {
+		specialCooldownOk := item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod
+		if specialCooldownOk {
+			return true, true, "special signal activated"
+		}
 	}
 
 	if item.LastNotifiedAt != nil && now.Sub(*item.LastNotifiedAt) < policy.Cooldown {
@@ -374,18 +379,14 @@ func shouldNotifyEvent(reco advisor.Recommendation, last *mongodb.SignalDoc, ite
 
 	lastStrength := actionStrengthFromSignal(*last)
 	if math.Abs(currStrength-lastStrength) >= policy.MinDeltaPct {
-		return true, false, fmt.Sprintf("confidence changed %.0f->%.0f", lastStrength, currStrength)
+		special := reco.IsSpecial
+		return true, special, fmt.Sprintf("confidence changed %.0f->%.0f", lastStrength, currStrength)
 	}
 
 	return false, false, "no meaningful change"
 }
 
 func shouldNotifyInterval(reco advisor.Recommendation, last *mongodb.SignalDoc, item mongodb.WatchlistItem, policy AlertPolicy, now time.Time) (bool, bool, string) {
-	specialDue := reco.IsSpecial && (item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod)
-	if specialDue {
-		return true, true, "interval + special signal"
-	}
-
 	if reco.Action == "HOLD" {
 		return false, false, "interval slot but hold filtered"
 	}
@@ -396,16 +397,27 @@ func shouldNotifyInterval(reco advisor.Recommendation, last *mongodb.SignalDoc, 
 	}
 
 	if last == nil {
-		return true, false, "interval first actionable signal"
+		special := reco.IsSpecial
+		return true, special, "interval first actionable signal"
+	}
+
+	// IsSpecial transition: not special → special (only when it first becomes special)
+	if reco.IsSpecial && !last.IsSpecial {
+		specialCooldownOk := item.LastSpecialAt == nil || now.Sub(*item.LastSpecialAt) >= specialCooldownPeriod
+		if specialCooldownOk {
+			return true, true, "interval + special signal activated"
+		}
 	}
 
 	if reco.Action != last.Action {
-		return true, false, fmt.Sprintf("interval action changed %s->%s", last.Action, reco.Action)
+		special := reco.IsSpecial
+		return true, special, fmt.Sprintf("interval action changed %s->%s", last.Action, reco.Action)
 	}
 
 	lastStrength := actionStrengthFromSignal(*last)
 	if math.Abs(currStrength-lastStrength) >= policy.MinDeltaPct {
-		return true, false, fmt.Sprintf("interval confidence changed %.0f->%.0f", lastStrength, currStrength)
+		special := reco.IsSpecial
+		return true, special, fmt.Sprintf("interval confidence changed %.0f->%.0f", lastStrength, currStrength)
 	}
 
 	return false, false, "interval slot but no meaningful change"

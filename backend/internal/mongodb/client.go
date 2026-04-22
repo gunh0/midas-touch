@@ -50,6 +50,7 @@ type SignalDoc struct {
 	HoldPct   float64   `bson:"hold_pct"  json:"hold_pct"`
 	Reason    string    `bson:"reason"    json:"reason"`
 	Notified  bool      `bson:"notified"  json:"notified"`
+	IsSpecial bool      `bson:"is_special,omitempty" json:"is_special,omitempty"`
 }
 
 // WatchlistItem is a user-registered symbol.

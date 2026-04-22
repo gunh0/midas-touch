@@ -255,6 +255,7 @@ func (s *SignalService) SaveSignal(ctx context.Context, symbol string, reco advi
 		HoldPct:   reco.HoldPercent,
 		Reason:    reco.Reason,
 		Notified:  notified,
+		IsSpecial: reco.IsSpecial,
 	}
 	if err := s.db.SaveSignal(ctx, sig); err != nil {
 		log.Printf("warn: save signal: %v", err)
