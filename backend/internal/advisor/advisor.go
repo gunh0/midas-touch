@@ -372,6 +372,7 @@ func FormatMessage(r Recommendation) string {
 	if r.Indicators.SupertrendDir < 0 {
 		stDir = "Bearish(하락)"
 	}
+	confidencePct := confidenceByAction(r)
 	fullName := r.FullName
 	if strings.TrimSpace(fullName) == "" {
 		fullName = SymbolFullName(r.TargetSymbol)
@@ -405,7 +406,11 @@ func FormatMessage(r Recommendation) string {
 		weeklyAction = r.TrendAction
 	}
 	entry, stop, target1, target2 := buildTradePlan(r, currentPrice)
-	entryLine := fmt.Sprintf("- Entry(진입가): $%.2f", entry)
+	entryChangePct := priceChangePct(currentPrice, entry)
+	stopChangePct := priceChangePct(currentPrice, stop)
+	target1ChangePct := priceChangePct(currentPrice, target1)
+	target2ChangePct := priceChangePct(currentPrice, target2)
+	entryLine := fmt.Sprintf("- Entry(진입가): $%.2f (%+.2f%%)", entry, entryChangePct)
 	stopLabel := "Stop Loss(손절가)"
 	target1Label := "Target 1(목표가1)"
 	target2Label := "Target 2(목표가2)"
@@ -422,6 +427,7 @@ func FormatMessage(r Recommendation) string {
 		"Midas Touch Signal (시그널)\n"+
 			"Time(시간): %s\n\n"+
 			"[%s] %s %s\n"+
+			"Confidence(신뢰도): %.0f%%\n"+
 			"Direction(방향 D): %s %s | Timing(타이밍 H): %s %s\n"+
 			"Buy(상승): %.0f%% | Hold(횡보): %.0f%% | Sell(하락): %.0f%%\n\n"+
 			"Multi-timeframe Direction (다중 타임프레임 방향성)\n"+
@@ -437,9 +443,9 @@ func FormatMessage(r Recommendation) string {
 			"- 7D Bias(스윙): %s %s (7D %+.2f%%)\n"+
 			"%s"+
 			"%s\n"+
-			"- %s: $%.2f\n"+
-			"- %s: $%.2f\n"+
-			"- %s: $%.2f\n\n"+
+			"- %s: $%.2f (%+.2f%%)\n"+
+			"- %s: $%.2f (%+.2f%%)\n"+
+			"- %s: $%.2f (%+.2f%%)\n\n"+
 			"Indicators(지표, 한글 설명 포함)\n"+
 			"- RSI14(상대강도지수): %.1f (과열/침체 강도 확인)\n"+
 			"- SMA20/50(단순이동평균): %.2f / %.2f (단기/중기 추세선)\n"+
@@ -452,6 +458,7 @@ func FormatMessage(r Recommendation) string {
 			"- USD/KRW: %.2f",
 		r.Timestamp.Format("2006-01-02 15:04 KST"),
 		title, actionSignalEmoji(r.Action), actionWithKorean(r.Action),
+		confidencePct,
 		actionSignalEmoji(r.TrendAction), actionWithKorean(r.TrendAction), actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),
 		r.BuyPercent, r.HoldPercent, r.SellPercent,
 		tf30,
@@ -464,7 +471,10 @@ func FormatMessage(r Recommendation) string {
 		intradayLabel, actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),
 		actionSignalEmoji(weeklyAction), actionWithKorean(weeklyAction), r.WeeklyChange,
 		planNote,
-		entryLine, stopLabel, stop, target1Label, target1, target2Label, target2,
+		entryLine,
+		stopLabel, stop, stopChangePct,
+		target1Label, target1, target1ChangePct,
+		target2Label, target2, target2ChangePct,
 		r.Indicators.RSI14,
 		r.Indicators.SMA20, r.Indicators.SMA50,
 		r.Indicators.BBUpper, r.Indicators.BBMid, r.Indicators.BBLower,
@@ -474,6 +484,24 @@ func FormatMessage(r Recommendation) string {
 		vixPct, nqPct,
 		r.USDKRWRate,
 	)
+}
+
+func confidenceByAction(r Recommendation) float64 {
+	switch strings.ToUpper(strings.TrimSpace(r.Action)) {
+	case "BUY":
+		return r.BuyPercent
+	case "SELL":
+		return r.SellPercent
+	default:
+		return r.HoldPercent
+	}
+}
+
+func priceChangePct(base, target float64) float64 {
+	if base == 0 {
+		return 0
+	}
+	return ((target - base) / base) * 100
 }
 
 func directionAt(tf map[string]string, key, fallback string) string {
