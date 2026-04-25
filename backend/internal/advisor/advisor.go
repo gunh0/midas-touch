@@ -409,6 +409,22 @@ func dominantAction(buy, sell, hold float64) string {
 	return "HOLD"
 }
 
+func rsiInterpretation(rsi float64) string {
+	if rsi >= 70 {
+		return "과열 - 너무 빨리 올라서 조정 가능성"
+	}
+	if rsi <= 30 {
+		return "과매도 - 너무 빨리 내려서 반등 가능성"
+	}
+	if rsi >= 40 && rsi <= 60 {
+		return "중립 구간 - 추세 확인이 더 중요"
+	}
+	if rsi > 60 && rsi < 70 {
+		return "중립 구간(상단) - 추격매수보다 눌림 확인 권장"
+	}
+	return "중립 구간(하단) - 반등 확인 후 접근 권장"
+}
+
 // FormatMessage formats a Recommendation for Telegram.
 func FormatMessage(r Recommendation) string {
 	stDir := "Bullish(상승)"
@@ -453,6 +469,7 @@ func FormatMessage(r Recommendation) string {
 		weeklyAction = r.TrendAction
 	}
 	entry, stop, target1, target2 := buildTradePlan(r, currentPrice)
+	rsiText := rsiInterpretation(r.Indicators.RSI14)
 	entryChangePct := priceChangePct(currentPrice, entry)
 	stopChangePct := priceChangePct(currentPrice, stop)
 	target1ChangePct := priceChangePct(currentPrice, target1)
@@ -495,7 +512,7 @@ func FormatMessage(r Recommendation) string {
 			"- %s: $%.2f (%+.2f%%)\n"+
 			"- %s: $%.2f (%+.2f%%)\n\n"+
 			"Indicators(지표, 한글 설명 포함)\n"+
-			"- RSI14(상대강도지수): %.1f (과열/침체 강도 확인)\n"+
+			"- RSI14(상대강도지수): %.1f (%s)\n"+
 			"- SMA20/50(단순이동평균): %.2f / %.2f (단기/중기 추세선)\n"+
 			"- BB(볼린저밴드 상/중/하): %.2f / %.2f / %.2f (변동성 범위)\n"+
 			"- Supertrend(추세전환선): %s (%.2f)\n"+
@@ -525,6 +542,7 @@ func FormatMessage(r Recommendation) string {
 		target1Label, target1, target1ChangePct,
 		target2Label, target2, target2ChangePct,
 		r.Indicators.RSI14,
+		rsiText,
 		r.Indicators.SMA20, r.Indicators.SMA50,
 		r.Indicators.BBUpper, r.Indicators.BBMid, r.Indicators.BBLower,
 		stDir, r.Indicators.SupertrendLine,

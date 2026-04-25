@@ -925,7 +925,6 @@ export default function Dashboard() {
               if (!symbolInputDirty) {
                 return;
               }
-              setInputSymbol("");
               setListSearchResults([]);
               setSymbolInputDirty(false);
             }}
@@ -984,9 +983,15 @@ export default function Dashboard() {
               {listSearchResults.map((row) => (
                 <button
                   key={`${row.symbol}-${row.exchange}`}
+                  onMouseDown={() => {
+                    suppressInputBlurClearRef.current = true;
+                  }}
                   onClick={() => {
-                    setInputSymbol(row.symbol.toUpperCase());
+                    const picked = row.symbol.toUpperCase();
+                    setInputSymbol(picked);
+                    setSymbolInputDirty(false);
                     setListSearchResults([]);
+                    handleAnalyze(picked);
                   }}
                   className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
                 >
