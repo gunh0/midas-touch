@@ -21,6 +21,11 @@ var popularLeaderSymbols = []string{
 	"NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD", "PLTR", "SMCI",
 }
 
+const (
+	minPreferredCloses = 50
+	minRelaxedCloses   = 20
+)
+
 // Indicators holds all computed technical indicator values.
 type Indicators struct {
 	RSI14 float64
@@ -63,6 +68,7 @@ type Recommendation struct {
 	WeeklyChange  float64
 	IsSpecial     bool
 	Reason        string
+	DataQualityNote string
 	USDKRWRate    float64
 	Snapshot      map[string]marketdata.Quote
 	Indicators    Indicators
@@ -122,17 +128,27 @@ func SymbolFullName(symbol string) string {
 
 // Evaluate computes Buy/Hold/Sell probabilities purely from chart indicators.
 // symbol: the ticker being analyzed (used for labeling only).
-// closes: daily close prices oldest-first, at least 50 required.
+// closes: daily close prices oldest-first, at least 20 required.
 func Evaluate(symbol string, snapshot map[string]marketdata.Quote, closes []float64, now time.Time) (Recommendation, error) {
-	if len(closes) < 50 {
-		return Recommendation{}, fmt.Errorf("need at least 50 closes, got %d", len(closes))
+	if len(closes) < minRelaxedCloses {
+		return Recommendation{}, fmt.Errorf("need at least %d closes, got %d", minRelaxedCloses, len(closes))
+	}
+
+	dataNote := ""
+	if len(closes) < minPreferredCloses {
+		dataNote = fmt.Sprintf("Limited history: %d daily bars (<%d). Provisional signal.", len(closes), minPreferredCloses)
 	}
 
 	ind := computeIndicators(closes)
 	score, reasons := scoreFromIndicators(ind, closes)
-	buy, sell, hold := toProbabilities(score.Total)
+	finalScore := dampenScoreForLimitedSamples(score.Total, len(closes), len(closes))
+	buy, sell, hold := toProbabilities(finalScore)
 	action := dominantAction(buy, sell, hold)
 	weeklyAction, weeklyChange := weeklyBiasFromCloses(closes)
+	reason := strings.Join(reasons, "; ")
+	if dataNote != "" {
+		reason = fmt.Sprintf("[DATA WARNING] %s\n%s", dataNote, reason)
+	}
 
 	return Recommendation{
 		TargetSymbol:  symbol,
@@ -146,7 +162,8 @@ func Evaluate(symbol string, snapshot map[string]marketdata.Quote, closes []floa
 		TimingTF:      "1d",
 		WeeklyAction:  weeklyAction,
 		WeeklyChange:  weeklyChange,
-		Reason:        strings.Join(reasons, "; "),
+		Reason:        reason,
+		DataQualityNote: dataNote,
 		Snapshot:      snapshot,
 		Indicators:    ind,
 		Timing:        ind,
@@ -161,11 +178,16 @@ func Evaluate(symbol string, snapshot map[string]marketdata.Quote, closes []floa
 // - daily closes: direction
 // - intraday closes: timing
 func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote, dailyCloses, intradayCloses []float64, now time.Time) (Recommendation, error) {
-	if len(dailyCloses) < 50 {
-		return Recommendation{}, fmt.Errorf("need at least 50 daily closes, got %d", len(dailyCloses))
+	if len(dailyCloses) < minRelaxedCloses {
+		return Recommendation{}, fmt.Errorf("need at least %d daily closes, got %d", minRelaxedCloses, len(dailyCloses))
 	}
-	if len(intradayCloses) < 50 {
-		return Recommendation{}, fmt.Errorf("need at least 50 intraday closes, got %d", len(intradayCloses))
+	if len(intradayCloses) < minRelaxedCloses {
+		return Recommendation{}, fmt.Errorf("need at least %d intraday closes, got %d", minRelaxedCloses, len(intradayCloses))
+	}
+
+	dataNote := ""
+	if len(dailyCloses) < minPreferredCloses || len(intradayCloses) < minPreferredCloses {
+		dataNote = fmt.Sprintf("Limited history: daily %d / intraday %d bars (<%d). Provisional signal.", len(dailyCloses), len(intradayCloses), minPreferredCloses)
 	}
 
 	dailyInd := computeIndicators(dailyCloses)
@@ -179,6 +201,7 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 	timingAction := dominantAction(tBuy, tSell, tHold)
 
 	finalScore := dailyScore.Total*0.65 + timingScore.Total*0.35
+	finalScore = dampenScoreForLimitedSamples(finalScore, len(dailyCloses), len(intradayCloses))
 	buy, sell, hold := toProbabilities(finalScore)
 	action := dominantAction(buy, sell, hold)
 	weeklyAction, weeklyChange := weeklyBiasFromCloses(dailyCloses)
@@ -199,6 +222,9 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 		strings.Join(dailyReasons, " | "),
 		strings.Join(timingReasons, " | "),
 	)
+	if dataNote != "" {
+		reason = fmt.Sprintf("[DATA WARNING] %s\n%s", dataNote, reason)
+	}
 
 	return Recommendation{
 		TargetSymbol:  symbol,
@@ -213,6 +239,7 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 		WeeklyChange:  weeklyChange,
 		IsSpecial:     isSpecial,
 		Reason:        reason,
+		DataQualityNote: dataNote,
 		Snapshot:      snapshot,
 		Indicators:    dailyInd,
 		Timing:        timingInd,
@@ -221,6 +248,22 @@ func EvaluateMultiTimeframe(symbol string, snapshot map[string]marketdata.Quote,
 		TimeframeBias: map[string]string{"1d": trendAction, "1mo": weeklyAction},
 		Timestamp:     now,
 	}, nil
+}
+
+func dampenScoreForLimitedSamples(score float64, dailyCount, intradayCount int) float64 {
+	minCount := dailyCount
+	if intradayCount < minCount {
+		minCount = intradayCount
+	}
+	if minCount >= minPreferredCloses {
+		return score
+	}
+	ratio := float64(minCount) / float64(minPreferredCloses)
+	if ratio < 0 {
+		ratio = 0
+	}
+	factor := 0.5 + (0.5 * ratio)
+	return score * factor
 }
 
 // computeIndicators calculates all technical indicators from close prices.
@@ -373,6 +416,10 @@ func FormatMessage(r Recommendation) string {
 		stDir = "Bearish(하락)"
 	}
 	confidencePct := confidenceByAction(r)
+	dataQualityLine := ""
+	if strings.TrimSpace(r.DataQualityNote) != "" {
+		dataQualityLine = fmt.Sprintf("Data Quality(데이터 품질): ⚠ %s\n\n", r.DataQualityNote)
+	}
 	fullName := r.FullName
 	if strings.TrimSpace(fullName) == "" {
 		fullName = SymbolFullName(r.TargetSymbol)
@@ -426,6 +473,7 @@ func FormatMessage(r Recommendation) string {
 	return fmt.Sprintf(
 		"Midas Touch Signal (시그널)\n"+
 			"Time(시간): %s\n\n"+
+			"%s"+
 			"[%s] %s %s\n"+
 			"Confidence(신뢰도): %.0f%%\n"+
 			"Direction(방향 D): %s %s | Timing(타이밍 H): %s %s\n"+
@@ -457,6 +505,7 @@ func FormatMessage(r Recommendation) string {
 			"- VIX: %+.2f%% | NQ: %+.2f%%\n"+
 			"- USD/KRW: %.2f",
 		r.Timestamp.Format("2006-01-02 15:04 KST"),
+		dataQualityLine,
 		title, actionSignalEmoji(r.Action), actionWithKorean(r.Action),
 		confidencePct,
 		actionSignalEmoji(r.TrendAction), actionWithKorean(r.TrendAction), actionSignalEmoji(r.TimingAction), actionWithKorean(r.TimingAction),

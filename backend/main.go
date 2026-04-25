@@ -462,26 +462,10 @@ func isAlignedScanSlot(now time.Time, intervalMinute int) bool {
 	if intervalMinute <= 0 {
 		intervalMinute = defaultIntervalMinute
 	}
-	minute := now.Minute()
-
-	// Minute-based intervals follow wall-clock boundaries and start at :interval
-	// (e.g. 3m => :03/:06..., 5m => :05/:10...).
-	if intervalMinute < 60 {
-		return minute != 0 && minute%intervalMinute == 0
-	}
-
-	if intervalMinute == 60 {
-		return minute == 0
-	}
-
-	if minute != 0 {
+	slot := now.Unix() / 60
+	if intervalMinute < 60 && now.Minute() == 0 {
 		return false
 	}
-
-	hours := intervalMinute / 60
-	if hours <= 0 {
-		hours = 1
-	}
-	return now.Hour()%hours == 0
+	return slot%int64(intervalMinute) == 0
 }
 

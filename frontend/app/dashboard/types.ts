@@ -36,6 +36,7 @@ export interface Signal {
   weekly_action?: string;
   timeframe_bias?: Record<string, string>;
   is_special_signal?: boolean;
+  data_quality_note?: string;
   buy_pct: number;
   sell_pct: number;
   hold_pct: number;

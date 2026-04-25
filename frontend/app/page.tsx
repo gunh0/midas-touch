@@ -20,10 +20,12 @@ import type {
   WatchlistItem,
 } from "./dashboard/types";
 import {
+  buildExecutionPlan,
   actionBg,
   actionColor,
   actionEmoji,
   formatPrice,
+  formatPct,
   inferCountryFromExchange,
   intervalShortLabel,
   normalizeTypeLabel,
@@ -51,6 +53,22 @@ type FavoriteAnalyzeNotifyResult = {
 };
 
 const DASHBOARD_PREFS_STORAGE_KEY = "midas.dashboard.preferences";
+const INTERVAL_OPTIONS_MINUTES = [
+  3,
+  5,
+  10,
+  15,
+  30,
+  60,
+  120,
+  180,
+  240,
+  360,
+  480,
+  720,
+  1440,
+];
+const DEFAULT_INTERVAL_MINUTE = 720;
 
 // ── Main dashboard ─────────────────────────────────────────────────────────
 export default function Dashboard() {
@@ -294,7 +312,7 @@ export default function Dashboard() {
   const addAlertTarget = async (sym: string, mode: "event" | "interval", selectedMinute?: number) => {
     setScanActionBusy(`${sym}:${mode}:add`);
     try {
-      const minute = mode === "interval" ? (selectedMinute ?? 5) : 5;
+      const minute = mode === "interval" ? (selectedMinute ?? DEFAULT_INTERVAL_MINUTE) : 5;
       const res = await fetch(`${API_BASE}/api/watchlist?symbol=${sym}&notify_interval_minutes=${minute}&notify_mode=${mode}`, {
         method: "POST",
       });
@@ -549,16 +567,31 @@ export default function Dashboard() {
   const alertsOnCount = watchlistItems.filter((x) => managedSet.has(String(x.symbol).toUpperCase())).length;
   const totalManagedCount = managedSymbols.length;
   const favoriteCount = watchlistItems.filter((x) => x.pinned).length;
+  const executionPlan = signal ? buildExecutionPlan(signal, currentPrice) : null;
 
   const pinnedSet = new Set(
     watchlistItems.filter((x) => x.pinned).map((x) => String(x.symbol).toUpperCase()),
   );
+  const watchlistBySymbol = new Map(
+    watchlistItems.map((x) => [String(x.symbol).toUpperCase(), x]),
+  );
+  const notifyModeRank = (sym: string) => {
+    const item = watchlistBySymbol.get(sym.toUpperCase());
+    // Event-first policy: interval-configured symbols are intentionally shown later.
+    return item?.notify_mode === "interval" ? 1 : 0;
+  };
   const sortScanRows = (a: ScanRow, b: ScanRow) => {
     const aPinned = pinnedSet.has(a.symbol);
     const bPinned = pinnedSet.has(b.symbol);
     if (aPinned !== bPinned) {
       return aPinned ? -1 : 1;
     }
+
+    const modeGap = notifyModeRank(a.symbol) - notifyModeRank(b.symbol);
+    if (modeGap !== 0) {
+      return modeGap;
+    }
+
     const scoreGap = topListScore(b) - topListScore(a);
     if (scoreGap !== 0) return scoreGap;
     const buyGap = b.signal.buy_pct - a.signal.buy_pct;
@@ -714,18 +747,18 @@ export default function Dashboard() {
                               <>
                                 <button onClick={() => addAlertTarget(row.symbol, "event")} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-50">E+</button>
                                 <select
-                                  value={pendingIntervalBySymbol[row.symbol] ?? 5}
+                                  value={pendingIntervalBySymbol[row.symbol] ?? DEFAULT_INTERVAL_MINUTE}
                                   onChange={(e) => setPendingIntervalBySymbol((prev) => ({ ...prev, [row.symbol]: Number(e.target.value) }))}
                                   className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-200"
+                                  title="Interval"
                                 >
-                                  <option value={5}>5m</option>
-                                  <option value={10}>10m</option>
-                                  <option value={30}>30m</option>
-                                  <option value={60}>1h</option>
-                                  <option value={240}>4h</option>
-                                  <option value={720}>12h</option>
+                                  {INTERVAL_OPTIONS_MINUTES.map((m) => (
+                                    <option key={m} value={m}>
+                                      {m % 60 === 0 ? `${m / 60}h` : `${m}m`}
+                                    </option>
+                                  ))}
                                 </select>
-                                <button onClick={() => addAlertTarget(row.symbol, "interval", pendingIntervalBySymbol[row.symbol] ?? 5)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50">I+</button>
+                                <button onClick={() => addAlertTarget(row.symbol, "interval", pendingIntervalBySymbol[row.symbol] ?? DEFAULT_INTERVAL_MINUTE)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50">I+</button>
                               </>
                             )}
                             {isOn && <button onClick={() => removeAlertTarget(row.symbol)} disabled={busy} className="text-[10px] px-1.5 py-0.5 rounded border border-red-500/40 text-red-200 hover:bg-red-500/20 disabled:opacity-50">Remove</button>}
@@ -903,7 +936,11 @@ export default function Dashboard() {
                 <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">D: {signal.trend_action ?? signal.action}</span>
                 <span className="px-2 py-0.5 rounded bg-slate-800/70 border border-slate-600">H: {signal.timing_action ?? signal.action}</span>
                 {signal.is_special_signal && <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300">Special</span>}
+                {signal.data_quality_note && <span className="px-2 py-0.5 rounded bg-orange-500/20 border border-orange-500/40 text-orange-200">Data Warning</span>}
               </div>
+              {signal.data_quality_note && (
+                <p className="mb-2 text-[11px] text-orange-200/90">{signal.data_quality_note}</p>
+              )}
               <div className="mb-2">
                 <p className="text-[11px] text-slate-400 mb-1">Multi-timeframe view</p>
                 <div className="flex flex-wrap gap-1.5 text-[10px]">
@@ -916,6 +953,17 @@ export default function Dashboard() {
                 </div>
               </div>
               <ProbBar buy={signal.buy_pct} sell={signal.sell_pct} hold={signal.hold_pct} />
+              {executionPlan && (
+                <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                  <p className="text-[11px] text-slate-400 mb-2">Execution Guide</p>
+                  <div className="space-y-1.5 text-[11px] text-slate-200">
+                    <p className="font-mono">- Entry: {formatPrice(executionPlan.entry)} ({formatPct(executionPlan.entryPct)})</p>
+                    <p className="font-mono">- Stop Loss: {formatPrice(executionPlan.stop)} ({formatPct(executionPlan.stopPct)})</p>
+                    <p className="font-mono">- Target 1: {formatPrice(executionPlan.target1)} ({formatPct(executionPlan.target1Pct)})</p>
+                    <p className="font-mono">- Target 2: {formatPrice(executionPlan.target2)} ({formatPct(executionPlan.target2Pct)})</p>
+                  </div>
+                </div>
+              )}
               <p className="text-xs text-slate-500 mt-2">{signal.timestamp ? new Date(signal.timestamp).toISOString().replace("T", " ").slice(0, 19) : ""}</p>
             </div>
           )}

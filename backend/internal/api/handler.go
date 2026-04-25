@@ -279,6 +279,7 @@ func (h *Handler) signalPayload(reco advisor.Recommendation) gin.H {
 		"timing_action":     reco.TimingAction,
 		"weekly_action":     reco.WeeklyAction,
 		"is_special_signal": reco.IsSpecial,
+		"data_quality_note": reco.DataQualityNote,
 		"buy_pct":           reco.BuyPercent,
 		"sell_pct":          reco.SellPercent,
 		"hold_pct":          reco.HoldPercent,
