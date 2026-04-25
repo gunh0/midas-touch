@@ -29,6 +29,8 @@ import (
 const (
 	defaultSymbol         = advisor.SymbolNVDA
 	defaultIntervalMinute = 3
+	defaultEvalBudgetPerCycle = 12
+	defaultIntervalBackoffMinutes = 20
 	monitorTickInterval   = 20 * time.Second
 	specialCooldownPeriod = 60 * time.Minute
 	dbFreeTierLimitMB     = 500.0
@@ -105,7 +107,113 @@ func main() {
 	if monitorMaxWorkers <= 0 {
 		monitorMaxWorkers = 1
 	}
+	evalBudgetPerCycle := parseIntWithDefault(os.Getenv("FINNHUB_EVAL_BUDGET_PER_CYCLE"), defaultEvalBudgetPerCycle)
+	if evalBudgetPerCycle < 0 {
+		evalBudgetPerCycle = 0
+	}
+	intervalBackoffMinutes := parseIntWithDefault(os.Getenv("FINNHUB_INTERVAL_BACKOFF_MINUTES"), defaultIntervalBackoffMinutes)
+	if intervalBackoffMinutes <= 0 {
+		intervalBackoffMinutes = defaultIntervalBackoffMinutes
+	}
+	intervalBackoff := time.Duration(intervalBackoffMinutes) * time.Minute
+	var intervalPausedUntil time.Time
+	var intervalPauseMu sync.RWMutex
 	lastScannedSlotBySymbol := map[string]int64{}
+	type monitorJob struct {
+		item         mongodb.WatchlistItem
+		timingTF     string
+		notifyMode   string
+		intervalMins int
+	}
+
+	pauseInterval := func(until time.Time, reason string) {
+		intervalPauseMu.Lock()
+		defer intervalPauseMu.Unlock()
+		if until.After(intervalPausedUntil) {
+			intervalPausedUntil = until
+			log.Printf("interval notifications paused until=%s reason=%s", intervalPausedUntil.Format(time.RFC3339), reason)
+		}
+	}
+
+	isIntervalPaused := func(now time.Time) bool {
+		intervalPauseMu.RLock()
+		defer intervalPauseMu.RUnlock()
+		return now.Before(intervalPausedUntil)
+	}
+
+	runMonitorJobs := func(jobs []monitorJob) {
+		if len(jobs) == 0 {
+			return
+		}
+
+		workers := monitorMaxWorkers
+		if workers > len(jobs) {
+			workers = len(jobs)
+		}
+
+		jobCh := make(chan monitorJob, len(jobs))
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobCh {
+					reco, err := signalSvc.EvaluateCached(ctx, job.item.Symbol, job.timingTF)
+					if err != nil {
+						if isRateLimitError(err) {
+							pauseInterval(time.Now().Add(intervalBackoff), fmt.Sprintf("rate-limit while evaluating %s", job.item.Symbol))
+						}
+						log.Printf("evaluate %s: %v", job.item.Symbol, err)
+						continue
+					}
+
+					if err := signalSvc.AutoPrune(ctx, job.item.Symbol); err != nil {
+						log.Printf("warn: auto prune %s: %v", job.item.Symbol, err)
+					}
+
+					shouldNotify := false
+					specialDue := false
+					why := ""
+					lastNotified, err := db.GetLatestNotifiedSignal(ctx, job.item.Symbol)
+					if err != nil {
+						log.Printf("warn: latest notified signal %s: %v", job.item.Symbol, err)
+						continue
+					}
+
+					if job.notifyMode == "interval" {
+						shouldNotify, specialDue, why = shouldNotifyInterval(reco, lastNotified, job.item, policy, time.Now())
+					} else {
+						shouldNotify, specialDue, why = shouldNotifyEvent(reco, lastNotified, job.item, policy, time.Now())
+					}
+
+					if !shouldNotify {
+						log.Printf("skip notify symbol=%s action=%s mode=%s reason=%s", job.item.Symbol, reco.Action, job.notifyMode, why)
+						continue
+					}
+
+					msg := advisor.FormatMessage(reco)
+					msg = formatSignalHeader(job.notifyMode, specialDue, why) + "\n\n" + msg
+
+					if err := tgClient.SendMessage(msg); err != nil {
+						log.Printf("telegram send %s: %v", job.item.Symbol, err)
+						continue
+					}
+
+					signalSvc.SaveSignal(ctx, job.item.Symbol, reco, true)
+					if err := db.MarkWatchlistNotified(ctx, job.item.Symbol, specialDue, time.Now()); err != nil {
+						log.Printf("warn: mark notified %s: %v", job.item.Symbol, err)
+					}
+					log.Printf("notified symbol=%s action=%s mode=%s special=%t reason=%s", job.item.Symbol, reco.Action, job.notifyMode, specialDue, why)
+				}
+			}()
+		}
+
+		for _, job := range jobs {
+			jobCh <- job
+		}
+		close(jobCh)
+		wg.Wait()
+	}
 
 	monitorOnce := func() {
 		now := time.Now()
@@ -152,12 +260,6 @@ func main() {
 			items, _ = db.GetWatchlist(ctx)
 		}
 
-		type monitorJob struct {
-			item         mongodb.WatchlistItem
-			timingTF     string
-			notifyMode   string
-			intervalMins int
-		}
 		jobsToRun := make([]monitorJob, 0, len(items))
 
 		for _, item := range items {
@@ -194,70 +296,42 @@ func main() {
 		}
 
 		if len(jobsToRun) > 0 {
-			workers := monitorMaxWorkers
-			if workers > len(jobsToRun) {
-				workers = len(jobsToRun)
-			}
-
-			jobCh := make(chan monitorJob, len(jobsToRun))
-			var wg sync.WaitGroup
-			for i := 0; i < workers; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for job := range jobCh {
-						reco, err := signalSvc.EvaluateCached(ctx, job.item.Symbol, job.timingTF)
-						if err != nil {
-							log.Printf("evaluate %s: %v", job.item.Symbol, err)
-							continue
-						}
-
-						if err := signalSvc.AutoPrune(ctx, job.item.Symbol); err != nil {
-							log.Printf("warn: auto prune %s: %v", job.item.Symbol, err)
-						}
-
-						shouldNotify := false
-						specialDue := false
-						why := ""
-						lastNotified, err := db.GetLatestNotifiedSignal(ctx, job.item.Symbol)
-						if err != nil {
-							log.Printf("warn: latest notified signal %s: %v", job.item.Symbol, err)
-							continue
-						}
-
-						if job.notifyMode == "interval" {
-							shouldNotify, specialDue, why = shouldNotifyInterval(reco, lastNotified, job.item, policy, now)
-						} else {
-							shouldNotify, specialDue, why = shouldNotifyEvent(reco, lastNotified, job.item, policy, now)
-						}
-
-						if !shouldNotify {
-							log.Printf("skip notify symbol=%s action=%s mode=%s reason=%s", job.item.Symbol, reco.Action, job.notifyMode, why)
-							continue
-						}
-
-						msg := advisor.FormatMessage(reco)
-						msg = formatSignalHeader(job.notifyMode, specialDue, why) + "\n\n" + msg
-
-						if err := tgClient.SendMessage(msg); err != nil {
-							log.Printf("telegram send %s: %v", job.item.Symbol, err)
-							continue
-						}
-
-						signalSvc.SaveSignal(ctx, job.item.Symbol, reco, true)
-						if err := db.MarkWatchlistNotified(ctx, job.item.Symbol, specialDue, now); err != nil {
-							log.Printf("warn: mark notified %s: %v", job.item.Symbol, err)
-						}
-						log.Printf("notified symbol=%s action=%s mode=%s special=%t reason=%s", job.item.Symbol, reco.Action, job.notifyMode, specialDue, why)
-					}
-				}()
-			}
-
+			eventJobs := make([]monitorJob, 0, len(jobsToRun))
+			intervalJobs := make([]monitorJob, 0, len(jobsToRun))
 			for _, job := range jobsToRun {
-				jobCh <- job
+				if job.notifyMode == "interval" {
+					intervalJobs = append(intervalJobs, job)
+				} else {
+					eventJobs = append(eventJobs, job)
+				}
 			}
-			close(jobCh)
-			wg.Wait()
+
+			intervalCandidates := intervalJobs
+			if isIntervalPaused(now) {
+				if len(intervalCandidates) > 0 {
+					log.Printf("skip interval jobs due to active rate-limit pause: skipped=%d", len(intervalCandidates))
+				}
+				intervalCandidates = nil
+			}
+
+			if evalBudgetPerCycle > 0 && len(intervalCandidates) > 0 {
+				remaining := evalBudgetPerCycle - len(eventJobs)
+				switch {
+				case remaining <= 0:
+					log.Printf("skip interval jobs due to budget saturation: budget=%d events=%d skippedIntervals=%d", evalBudgetPerCycle, len(eventJobs), len(intervalCandidates))
+					intervalCandidates = nil
+				case remaining < len(intervalCandidates):
+					log.Printf("trim interval jobs due to budget: budget=%d events=%d intervalRun=%d intervalSkipped=%d", evalBudgetPerCycle, len(eventJobs), remaining, len(intervalCandidates)-remaining)
+					intervalCandidates = intervalCandidates[:remaining]
+				}
+			}
+
+			if len(eventJobs) > 0 {
+				runMonitorJobs(eventJobs)
+			}
+			if len(intervalCandidates) > 0 {
+				runMonitorJobs(intervalCandidates)
+			}
 		}
 
 	}
@@ -467,5 +541,13 @@ func isAlignedScanSlot(now time.Time, intervalMinute int) bool {
 		return false
 	}
 	return slot%int64(intervalMinute) == 0
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	v := strings.ToLower(err.Error())
+	return strings.Contains(v, "status 429") || strings.Contains(v, "too many requests") || strings.Contains(v, "rate limit")
 }
 

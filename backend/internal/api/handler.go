@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -62,6 +63,7 @@ func NewRouter(h *Handler) *gin.Engine {
 		api.POST("/signals/batch", h.signalsBatch)
 		api.GET("/signals", h.signals)
 		api.GET("/symbols/search", h.searchSymbols)
+		api.GET("/valuation", h.valuation)
 		api.POST("/notify", h.notify)
 		api.GET("/watchlist", h.getWatchlist)
 		api.POST("/watchlist", h.addWatchlist)
@@ -74,6 +76,149 @@ func NewRouter(h *Handler) *gin.Engine {
 	}
 
 	return r
+}
+
+type valuationModelResult struct {
+	Name      string  `json:"name"`
+	Value     float64 `json:"value"`
+	Available bool    `json:"available"`
+	Note      string  `json:"note,omitempty"`
+}
+
+func clampFloat(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func modelDCF(in marketdata.ValuationInputs) valuationModelResult {
+	if in.FreeCashflow <= 0 || in.SharesOutstanding <= 0 {
+		return valuationModelResult{Name: "DCF", Available: false, Note: "insufficient free cash flow data"}
+	}
+
+	fcfPerShare := in.FreeCashflow / in.SharesOutstanding
+	g := in.EarningsGrowth
+	if g == 0 {
+		g = 0.06
+	}
+	g = clampFloat(g, -0.02, 0.18)
+	r := 0.10
+	tg := 0.03
+
+	pv := 0.0
+	for y := 1; y <= 5; y++ {
+		fcf := fcfPerShare * math.Pow(1+g, float64(y))
+		pv += fcf / math.Pow(1+r, float64(y))
+	}
+	terminalCF := fcfPerShare * math.Pow(1+g, 5) * (1 + tg)
+	terminal := terminalCF / (r - tg)
+	pv += terminal / math.Pow(1+r, 5)
+
+	return valuationModelResult{Name: "DCF", Value: pv, Available: true}
+}
+
+func modelComparables(in marketdata.ValuationInputs) valuationModelResult {
+	values := []float64{}
+	eps := in.TrailingEPS
+	if eps <= 0 {
+		eps = in.ForwardEPS
+	}
+	if eps > 0 {
+		values = append(values, eps*18.0)
+	}
+	if in.BookValue > 0 {
+		values = append(values, in.BookValue*3.0)
+	}
+	if in.TargetMeanPrice > 0 {
+		values = append(values, in.TargetMeanPrice)
+	}
+	if len(values) == 0 {
+		return valuationModelResult{Name: "Industry Multiples", Available: false, Note: "missing EPS/book value inputs"}
+	}
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+	return valuationModelResult{Name: "Industry Multiples", Value: sum / float64(len(values)), Available: true}
+}
+
+func modelDDM(in marketdata.ValuationInputs) valuationModelResult {
+	if in.DividendRate <= 0 {
+		return valuationModelResult{Name: "Dividend Discount", Available: false, Note: "no regular dividend"}
+	}
+	r := 0.09
+	g := 0.03
+	d1 := in.DividendRate * (1 + g)
+	value := d1 / (r - g)
+	return valuationModelResult{Name: "Dividend Discount", Value: value, Available: true}
+}
+
+func blendedValuation(models []valuationModelResult) valuationModelResult {
+	available := make([]float64, 0, len(models))
+	for _, m := range models {
+		if m.Available && m.Value > 0 {
+			available = append(available, m.Value)
+		}
+	}
+	if len(available) == 0 {
+		return valuationModelResult{Name: "Blended Fair Value", Available: false, Note: "no available valuation model"}
+	}
+	sum := 0.0
+	for _, v := range available {
+		sum += v
+	}
+	return valuationModelResult{Name: "Blended Fair Value", Value: sum / float64(len(available)), Available: true}
+}
+
+func (h *Handler) valuation(c *gin.Context) {
+	symbol := service.NormalizeSymbol(c.Query("symbol"))
+	inputs, err := h.marketClient.FetchValuationInputs(symbol)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	dcf := modelDCF(inputs)
+	comps := modelComparables(inputs)
+	ddm := modelDDM(inputs)
+	blend := blendedValuation([]valuationModelResult{dcf, comps, ddm})
+
+	upsidePct := 0.0
+	if blend.Available && inputs.CurrentPrice > 0 {
+		upsidePct = ((blend.Value - inputs.CurrentPrice) / inputs.CurrentPrice) * 100
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"symbol": symbol,
+		"currency": inputs.Currency,
+		"current_price": inputs.CurrentPrice,
+		"upside_pct": upsidePct,
+		"models": []valuationModelResult{dcf, comps, ddm, blend},
+		"inputs": gin.H{
+			"target_mean_price": inputs.TargetMeanPrice,
+			"target_low_price": inputs.TargetLowPrice,
+			"target_high_price": inputs.TargetHighPrice,
+			"free_cashflow": inputs.FreeCashflow,
+			"earnings_growth": inputs.EarningsGrowth,
+			"shares_outstanding": inputs.SharesOutstanding,
+			"trailing_eps": inputs.TrailingEPS,
+			"forward_eps": inputs.ForwardEPS,
+			"book_value": inputs.BookValue,
+			"dividend_rate": inputs.DividendRate,
+			"dividend_yield": inputs.DividendYield,
+		},
+		"assumptions": gin.H{
+			"discount_rate": 0.10,
+			"terminal_growth": 0.03,
+			"pe_proxy": 18.0,
+			"pb_proxy": 3.0,
+			"note": "Model outputs are heuristic estimates, not investment advice.",
+		},
+	})
 }
 
 type SourceStatus struct {

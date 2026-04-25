@@ -16,6 +16,7 @@ const (
 	finnhubCandleAPI = "https://finnhub.io/api/v1/stock/candle"
 	usdkrwRateAPI   = "https://api.frankfurter.app/latest?from=USD&to=KRW"
 	yahooChartAPI   = "https://query1.finance.yahoo.com/v8/finance/chart/"
+	yahooQuoteSummaryAPI = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
 	yahooSearchAPI  = "https://query2.finance.yahoo.com/v1/finance/search"
 )
 
@@ -46,6 +47,23 @@ type SymbolSearchResult struct {
 	Name        string `json:"name"`
 	Exchange    string `json:"exchange"`
 	TypeDisplay string `json:"type_display"`
+}
+
+type ValuationInputs struct {
+	Symbol           string
+	Currency         string
+	CurrentPrice     float64
+	TargetMeanPrice  float64
+	TargetLowPrice   float64
+	TargetHighPrice  float64
+	FreeCashflow     float64
+	EarningsGrowth   float64
+	SharesOutstanding float64
+	TrailingEPS      float64
+	ForwardEPS       float64
+	BookValue        float64
+	DividendRate     float64
+	DividendYield    float64
 }
 
 type finnhubQuoteResponse struct {
@@ -97,6 +115,42 @@ type yahooSearchResponse struct {
 		Exchange string `json:"exchange"`
 		TypeDisp string `json:"quoteType"`
 	} `json:"quotes"`
+}
+
+type yahooNumberRaw struct {
+	Raw float64 `json:"raw"`
+}
+
+type yahooQuoteSummaryResponse struct {
+	QuoteSummary struct {
+		Result []struct {
+			Price struct {
+				Currency           string         `json:"currency"`
+				RegularMarketPrice yahooNumberRaw `json:"regularMarketPrice"`
+			} `json:"price"`
+			FinancialData struct {
+				TargetMeanPrice yahooNumberRaw `json:"targetMeanPrice"`
+				TargetLowPrice  yahooNumberRaw `json:"targetLowPrice"`
+				TargetHighPrice yahooNumberRaw `json:"targetHighPrice"`
+				FreeCashflow    yahooNumberRaw `json:"freeCashflow"`
+				EarningsGrowth  yahooNumberRaw `json:"earningsGrowth"`
+			} `json:"financialData"`
+			DefaultKeyStatistics struct {
+				SharesOutstanding yahooNumberRaw `json:"sharesOutstanding"`
+				TrailingEps       yahooNumberRaw `json:"trailingEps"`
+				ForwardEps        yahooNumberRaw `json:"forwardEps"`
+				BookValue         yahooNumberRaw `json:"bookValue"`
+			} `json:"defaultKeyStatistics"`
+			SummaryDetail struct {
+				DividendRate  yahooNumberRaw `json:"dividendRate"`
+				DividendYield yahooNumberRaw `json:"dividendYield"`
+			} `json:"summaryDetail"`
+		} `json:"result"`
+		Error *struct {
+			Code        string `json:"code"`
+			Description string `json:"description"`
+		} `json:"error"`
+	} `json:"quoteSummary"`
 }
 
 func NewClient() *Client {
@@ -155,6 +209,65 @@ func (c *Client) FetchUSDKRWRate() (float64, error) {
 	}
 
 	return rate, nil
+}
+
+func (c *Client) FetchValuationInputs(symbol string) (ValuationInputs, error) {
+	yahooSymbol := toYahooSymbol(symbol)
+	reqURL, err := url.Parse(yahooQuoteSummaryAPI + yahooSymbol)
+	if err != nil {
+		return ValuationInputs{}, fmt.Errorf("parse yahoo quoteSummary url: %w", err)
+	}
+	q := reqURL.Query()
+	q.Set("modules", "price,financialData,defaultKeyStatistics,summaryDetail")
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return ValuationInputs{}, fmt.Errorf("build yahoo quoteSummary request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return ValuationInputs{}, fmt.Errorf("request yahoo quoteSummary api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ValuationInputs{}, fmt.Errorf("yahoo quoteSummary api returned status %d", resp.StatusCode)
+	}
+
+	var decoded yahooQuoteSummaryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return ValuationInputs{}, fmt.Errorf("decode yahoo quoteSummary response: %w", err)
+	}
+
+	if decoded.QuoteSummary.Error != nil {
+		return ValuationInputs{}, fmt.Errorf("yahoo quoteSummary error: %s - %s", decoded.QuoteSummary.Error.Code, decoded.QuoteSummary.Error.Description)
+	}
+	if len(decoded.QuoteSummary.Result) == 0 {
+		return ValuationInputs{}, fmt.Errorf("yahoo quoteSummary returned no results for %s", yahooSymbol)
+	}
+
+	r := decoded.QuoteSummary.Result[0]
+	return ValuationInputs{
+		Symbol:            strings.ToUpper(strings.TrimSpace(symbol)),
+		Currency:          r.Price.Currency,
+		CurrentPrice:      r.Price.RegularMarketPrice.Raw,
+		TargetMeanPrice:   r.FinancialData.TargetMeanPrice.Raw,
+		TargetLowPrice:    r.FinancialData.TargetLowPrice.Raw,
+		TargetHighPrice:   r.FinancialData.TargetHighPrice.Raw,
+		FreeCashflow:      r.FinancialData.FreeCashflow.Raw,
+		EarningsGrowth:    r.FinancialData.EarningsGrowth.Raw,
+		SharesOutstanding: r.DefaultKeyStatistics.SharesOutstanding.Raw,
+		TrailingEPS:       r.DefaultKeyStatistics.TrailingEps.Raw,
+		ForwardEPS:        r.DefaultKeyStatistics.ForwardEps.Raw,
+		BookValue:         r.DefaultKeyStatistics.BookValue.Raw,
+		DividendRate:      r.SummaryDetail.DividendRate.Raw,
+		DividendYield:     r.SummaryDetail.DividendYield.Raw,
+	}, nil
 }
 
 // FetchDailyCloses returns only close prices.
@@ -527,7 +640,7 @@ func yahooIntervalForResolution(resolution string) string {
 		return "15m"
 	case "30":
 		return "30m"
-	case "60", "120", "240":
+	case "60", "120", "240", "300":
 		return "60m"
 	default:
 		return ""
@@ -643,6 +756,8 @@ func normalizeResolution(resolution string) string {
 		return "120"
 	case "240", "4h", "h4":
 		return "240"
+	case "300", "5h", "h5":
+		return "300"
 	default:
 		return resolution
 	}
@@ -662,6 +777,8 @@ func resolutionMinutes(resolution string) int {
 		return 120
 	case "240":
 		return 240
+	case "300":
+		return 300
 	default:
 		return 0
 	}

@@ -107,6 +107,8 @@ func NormalizeTimeframe(tf string) string {
 		return "120"
 	case "240", "4h", "h4":
 		return "240"
+	case "300", "5h", "h5":
+		return "300"
 	default:
 		return "1d"
 	}

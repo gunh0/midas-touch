@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE, fetchJSON } from "./dashboard/api";
 import { CandleChart } from "./dashboard/components/CandleChart";
 import { DailyClose30Panel } from "./dashboard/components/DailyClose30Panel";
@@ -15,7 +15,9 @@ import type {
   ScanRow,
   Signal,
   SymbolSearchResult,
+  TechnicalConsensusRow,
   UniverseSymbol,
+  ValuationResponse,
   ViewHistoryRow,
   WatchlistItem,
 } from "./dashboard/types";
@@ -74,6 +76,7 @@ const DEFAULT_INTERVAL_MINUTE = 720;
 export default function Dashboard() {
   const [symbol, setSymbol] = useState("NVDA");
   const [inputSymbol, setInputSymbol] = useState("NVDA");
+  const [symbolInputDirty, setSymbolInputDirty] = useState(false);
   const [watchlistItems, setWatchlistItems] = useState<WatchlistItem[]>([]);
   const [candles, setCandles] = useState<CandleDoc[]>([]);
   const [hourlyCandles, setHourlyCandles] = useState<CandleDoc[]>([]);
@@ -103,6 +106,64 @@ export default function Dashboard() {
   const [pendingIntervalBySymbol, setPendingIntervalBySymbol] = useState<Record<string, number>>({});
   const [listSearchResults, setListSearchResults] = useState<SymbolSearchResult[]>([]);
   const [listSearching, setListSearching] = useState(false);
+  const [valuation, setValuation] = useState<ValuationResponse | null>(null);
+  const [valuationLoading, setValuationLoading] = useState(false);
+  const [technicalRows, setTechnicalRows] = useState<TechnicalConsensusRow[]>([]);
+  const [technicalLoading, setTechnicalLoading] = useState(false);
+  const suppressInputBlurClearRef = useRef(false);
+
+  const ChartLoading = () => (
+    <div className="h-[300px] flex flex-col items-center justify-center gap-3 text-slate-400">
+      <div className="h-10 w-10 rounded-full border-2 border-slate-600 border-t-cyan-300 animate-spin" />
+      <p className="text-xs tracking-wide">Loading chart...</p>
+    </div>
+  );
+
+  const CardSkeleton = ({ rows = 4 }: { rows?: number }) => (
+    <div className="space-y-2 animate-pulse">
+      {Array.from({ length: rows }).map((_, idx) => (
+        <div key={idx} className="rounded-lg border border-slate-700 p-2.5">
+          <div className="h-3 w-20 rounded bg-slate-700/80" />
+          <div className="mt-2 h-3 w-full rounded bg-slate-700/60" />
+        </div>
+      ))}
+    </div>
+  );
+
+  const parseAction = (raw?: string): "BUY" | "SELL" | "HOLD" => {
+    const v = String(raw ?? "").toUpperCase();
+    if (v === "BUY" || v === "SELL") return v;
+    return "HOLD";
+  };
+
+  const confidenceForAction = (action: "BUY" | "SELL" | "HOLD", s: Signal) => {
+    if (action === "BUY") return s.buy_pct;
+    if (action === "SELL") return s.sell_pct;
+    return s.hold_pct;
+  };
+
+  const consensusLabel = (action: "BUY" | "SELL" | "HOLD", confidence: number): TechnicalConsensusRow["signal"] => {
+    if (action === "SELL") {
+      if (confidence >= 67) return "Strong Sell";
+      return "Sell";
+    }
+    if (action === "BUY") {
+      if (confidence >= 67) return "Strong Buy";
+      return "Buy";
+    }
+    return "Neutral";
+  };
+
+  const rowFromSignal = (timeframe: string, s: Signal): TechnicalConsensusRow => {
+    const action = parseAction(s.timing_action ?? s.action);
+    const confidence = confidenceForAction(action, s);
+    return {
+      timeframe,
+      action,
+      confidence,
+      signal: consensusLabel(action, confidence),
+    };
+  };
 
   const loadUniverse = useCallback(async () => {
     try {
@@ -170,9 +231,15 @@ export default function Dashboard() {
     if (!silent) {
       setLoading(true);
       setError("");
+      setCandles([]);
       setSignal(null);
       setHourlyCandles([]);
+      setDaily30Candles([]);
+      setValuation(null);
+      setTechnicalRows([]);
     }
+    setValuationLoading(true);
+    setTechnicalLoading(true);
     try {
       const [c, h7, d30, s] = await Promise.all([
         fetchJSON<CandleDoc[]>(`/api/candles?symbol=${sym}&timeframe=1d&limit=300`),
@@ -185,9 +252,47 @@ export default function Dashboard() {
       setDaily30Candles(d30);
       setSignal(s);
       setLastUpdate(new Date().toISOString().slice(11, 19));
+
+      const [valuationRes, tf5, tf15, tf30, tf60, tf300] = await Promise.allSettled([
+        fetchJSON<ValuationResponse>(`/api/valuation?symbol=${sym}`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=5`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=15`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=30`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=60`),
+        fetchJSON<Signal>(`/api/signal?symbol=${sym}&timing_tf=300`),
+      ]);
+
+      if (valuationRes.status === "fulfilled") {
+        setValuation(valuationRes.value);
+      } else {
+        setValuation(null);
+      }
+
+      const rows: TechnicalConsensusRow[] = [];
+      if (tf5.status === "fulfilled") rows.push(rowFromSignal("5m", tf5.value));
+      if (tf15.status === "fulfilled") rows.push(rowFromSignal("15m", tf15.value));
+      if (tf30.status === "fulfilled") rows.push(rowFromSignal("30m", tf30.value));
+      if (tf60.status === "fulfilled") rows.push(rowFromSignal("1h", tf60.value));
+      if (tf300.status === "fulfilled") rows.push(rowFromSignal("5h", tf300.value));
+
+      const dailyAction = parseAction(s.timeframe_bias?.["1d"] ?? s.trend_action ?? s.action);
+      const weeklyAction = parseAction(s.weekly_action ?? s.timeframe_bias?.["1mo"] ?? s.trend_action ?? s.action);
+      const monthlyAction = parseAction(s.timeframe_bias?.["1mo"] ?? s.weekly_action ?? s.trend_action ?? s.action);
+      const dailyConfidence = confidenceForAction(dailyAction, s);
+      const weeklyConfidence = confidenceForAction(weeklyAction, s);
+      const monthlyConfidence = confidenceForAction(monthlyAction, s);
+
+      rows.push({ timeframe: "1D", action: dailyAction, confidence: dailyConfidence, signal: consensusLabel(dailyAction, dailyConfidence) });
+      rows.push({ timeframe: "1W", action: weeklyAction, confidence: weeklyConfidence, signal: consensusLabel(weeklyAction, weeklyConfidence) });
+      rows.push({ timeframe: "1M", action: monthlyAction, confidence: monthlyConfidence, signal: consensusLabel(monthlyAction, monthlyConfidence) });
+      setTechnicalRows(rows);
     } catch (e) {
       setError(String(e));
+      setValuation(null);
+      setTechnicalRows([]);
     } finally {
+      setValuationLoading(false);
+      setTechnicalLoading(false);
       if (!silent) {
         setLoading(false);
       }
@@ -198,6 +303,7 @@ export default function Dashboard() {
     const target = (sym ?? inputSymbol).trim().toUpperCase();
     if (!target) return;
     setInputSymbol(target);
+    setSymbolInputDirty(false);
     setNotifyMsg("");
     touchViewHistory(target);
     if (target === symbol) {
@@ -393,6 +499,7 @@ export default function Dashboard() {
     const query = inputSymbol.trim();
     const sym = query.toUpperCase();
     if (!sym) return;
+    setSymbolInputDirty(false);
 
     try {
       setListSearching(true);
@@ -568,6 +675,8 @@ export default function Dashboard() {
   const totalManagedCount = managedSymbols.length;
   const favoriteCount = watchlistItems.filter((x) => x.pinned).length;
   const executionPlan = signal ? buildExecutionPlan(signal, currentPrice) : null;
+  const showTechnicalSkeleton = loading && technicalRows.length === 0;
+  const showValuationSkeleton = loading && !valuation;
 
   const pinnedSet = new Set(
     watchlistItems.filter((x) => x.pinned).map((x) => String(x.symbol).toUpperCase()),
@@ -804,13 +913,46 @@ export default function Dashboard() {
           <input
             type="text"
             value={inputSymbol}
-            onChange={(e) => setInputSymbol(e.target.value.toUpperCase())}
+            onChange={(e) => {
+              setInputSymbol(e.target.value.toUpperCase());
+              setSymbolInputDirty(true);
+            }}
+            onBlur={() => {
+              if (suppressInputBlurClearRef.current) {
+                suppressInputBlurClearRef.current = false;
+                return;
+              }
+              if (!symbolInputDirty) {
+                return;
+              }
+              setInputSymbol("");
+              setListSearchResults([]);
+              setSymbolInputDirty(false);
+            }}
             onKeyDown={(e) => e.key === "Enter" && handleAnalyze()}
             placeholder="NVDA, AAPL, TSLA..."
             className="px-3 py-2 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg w-36 focus:outline-none focus:border-indigo-500"
           />
-          <button onClick={() => handleAnalyze()} disabled={loading} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50">{loading ? "Loading..." : "Analyze"}</button>
-          <button onClick={addUniverseSymbol} disabled={listSearching} className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm rounded-lg transition-colors disabled:opacity-50">{listSearching ? "Validating..." : "Add to List"}</button>
+          <button
+            onMouseDown={() => {
+              suppressInputBlurClearRef.current = true;
+            }}
+            onClick={() => handleAnalyze()}
+            disabled={loading}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50"
+          >
+            {loading ? "Loading..." : "Analyze"}
+          </button>
+          <button
+            onMouseDown={() => {
+              suppressInputBlurClearRef.current = true;
+            }}
+            onClick={addUniverseSymbol}
+            disabled={listSearching}
+            className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm rounded-lg transition-colors disabled:opacity-50"
+          >
+            {listSearching ? "Validating..." : "Add to List"}
+          </button>
           <div className="inline-flex items-center gap-1 rounded-lg border border-slate-600 bg-slate-800 px-2 py-1.5">
             <button
               onClick={() => setAutoRefreshEnabled((v) => !v)}
@@ -907,7 +1049,7 @@ export default function Dashboard() {
               <h2 className="font-semibold text-slate-200">{symbol} Daily Chart</h2>
               {signal && <span className={`text-xs font-bold px-2 py-1 rounded border ${actionBg(signal.action)}`}><span className={actionColor(signal.action)}>{signal.action}</span></span>}
             </div>
-            {candles.length > 0 ? <CandleChart candles={candles} /> : <div className="h-[300px] flex items-center justify-center text-slate-500">{loading ? "Loading chart..." : "No data"}</div>}
+            {loading ? <ChartLoading /> : candles.length > 0 ? <CandleChart candles={candles} /> : <div className="h-[300px] flex items-center justify-center text-slate-500">No data</div>}
           </div>
 
           {signal?.score && (
@@ -967,6 +1109,92 @@ export default function Dashboard() {
               <p className="text-xs text-slate-500 mt-2">{signal.timestamp ? new Date(signal.timestamp).toISOString().replace("T", " ").slice(0, 19) : ""}</p>
             </div>
           )}
+
+          <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold text-slate-200">Technical Analysis</h2>
+              {technicalLoading && <span className="text-[11px] text-slate-500">Loading...</span>}
+            </div>
+            {showTechnicalSkeleton ? (
+              <CardSkeleton rows={6} />
+            ) : technicalRows.length === 0 ? (
+              <p className="text-xs text-slate-500">No technical consensus data.</p>
+            ) : (
+              <div className="space-y-2">
+                {technicalRows.map((row) => {
+                  const cls = row.signal === "Strong Sell"
+                    ? "text-red-300 border-red-500/40 bg-red-500/10"
+                    : row.signal === "Sell"
+                      ? "text-orange-300 border-orange-500/40 bg-orange-500/10"
+                      : row.signal === "Strong Buy"
+                        ? "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
+                        : row.signal === "Buy"
+                          ? "text-cyan-300 border-cyan-500/40 bg-cyan-500/10"
+                          : "text-slate-300 border-slate-600 bg-slate-700/30";
+
+                  return (
+                    <div key={row.timeframe} className="flex items-center justify-between rounded-lg border border-slate-700 p-2">
+                      <span className="text-xs font-mono text-slate-300">{row.timeframe}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-slate-500">{row.confidence.toFixed(0)}%</span>
+                        <span className={`text-[11px] px-2 py-0.5 rounded border ${cls}`}>{row.signal}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {technicalRows.length > 0 && (
+              <p className="text-[11px] text-slate-500 mt-3">
+                Summary: {technicalRows.filter((r) => r.signal === "Strong Sell").length >= 3
+                  ? "Strong Sell"
+                  : technicalRows.filter((r) => r.signal === "Strong Buy").length >= 3
+                    ? "Strong Buy"
+                    : "Mixed"}
+              </p>
+            )}
+          </div>
+
+          <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold text-slate-200">Valuation Models</h2>
+              {valuationLoading && <span className="text-[11px] text-slate-500">Loading...</span>}
+            </div>
+
+            {showValuationSkeleton ? (
+              <CardSkeleton rows={4} />
+            ) : !valuation ? (
+              <p className="text-xs text-slate-500">Valuation data is unavailable for this symbol.</p>
+            ) : (
+              <>
+                <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 mb-3">
+                  <p className="text-[11px] text-slate-400">Current Price</p>
+                  <p className="text-base font-semibold text-white mt-1">{formatPrice(valuation.current_price)}</p>
+                  <p className={`text-xs mt-1 ${valuation.upside_pct >= 0 ? "text-emerald-300" : "text-red-300"}`}>
+                    Fair Value Gap: {formatPct(valuation.upside_pct)}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  {valuation.models.map((m) => (
+                    <div key={m.name} className="rounded-lg border border-slate-700 p-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-300">{m.name}</span>
+                        <span className={`text-xs font-mono ${m.available ? "text-cyan-300" : "text-slate-500"}`}>
+                          {m.available ? formatPrice(m.value) : "N/A"}
+                        </span>
+                      </div>
+                      {m.note && <p className="text-[11px] text-slate-500 mt-1">{m.note}</p>}
+                    </div>
+                  ))}
+                </div>
+
+                {valuation.assumptions?.note && (
+                  <p className="text-[11px] text-slate-500 mt-3">{valuation.assumptions.note}</p>
+                )}
+              </>
+            )}
+          </div>
 
           {signal?.indicators && (
             <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">

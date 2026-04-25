@@ -102,3 +102,32 @@ export interface ViewHistoryRow {
   symbol: string;
   last_viewed: string;
 }
+
+export interface ValuationModelResult {
+  name: string;
+  value: number;
+  available: boolean;
+  note?: string;
+}
+
+export interface ValuationResponse {
+  symbol: string;
+  currency: string;
+  current_price: number;
+  upside_pct: number;
+  models: ValuationModelResult[];
+  assumptions?: {
+    discount_rate?: number;
+    terminal_growth?: number;
+    pe_proxy?: number;
+    pb_proxy?: number;
+    note?: string;
+  };
+}
+
+export interface TechnicalConsensusRow {
+  timeframe: string;
+  signal: "Strong Sell" | "Sell" | "Neutral" | "Buy" | "Strong Buy";
+  action: "BUY" | "SELL" | "HOLD";
+  confidence: number;
+}
